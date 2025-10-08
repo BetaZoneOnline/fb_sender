@@ -1,7 +1,7 @@
 import time
 import json
 import os
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, QEventLoop
 
 def make_typing_script(message, autosend=True):
     msg_js = json.dumps(message)  # safe escaping
@@ -172,6 +172,33 @@ class BrowserAutomation:
         self.callback = None  # Callback function for completion
         self.error_detected = False  # Initialize error detection flag
         self.message_box_present = False  # Initialize message box presence flag
+        self._last_js_result = None  # Store last JS result for debugging
+
+    def _run_javascript_sync(self, script, timeout_ms=10000):
+        """Execute JavaScript and wait synchronously for the result."""
+        loop = QEventLoop()
+        result_container = {}
+
+        def callback(result):
+            result_container['result'] = result
+            if loop.isRunning():
+                loop.quit()
+
+        try:
+            self.browser.page().runJavaScript(script, callback)
+        except Exception as error:
+            print(f"ERROR: Failed to dispatch JavaScript: {error}")
+            return None
+
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        timer.start(timeout_ms)
+        loop.exec()
+        timer.stop()
+
+        self._last_js_result = result_container.get('result')
+        return self._last_js_result
     
     def setup_permanent_popup_blocking(self):
         """Set up permanent popup blocking that runs on every page load"""
@@ -379,52 +406,130 @@ class BrowserAutomation:
         
         print("Testing JavaScript execution...")
         try:
-            # Try running JavaScript on the browser page
-            test_result = self.browser.page().runJavaScript(simple_test_script, 0)
+            test_result = self._run_javascript_sync(simple_test_script, timeout_ms=5000)
             print(f"JavaScript test result: {test_result}")
         except Exception as e:
             print(f"ERROR: JavaScript execution failed with exception: {e}")
             self.message_box_present = False
             return
-        
-        if not test_result:
-            print("ERROR: JavaScript execution is failing - no result returned")
+
+        success_flag = isinstance(test_result, dict) and test_result.get('success')
+        if not success_flag:
+            error_reason = test_result.get('error') if isinstance(test_result, dict) else 'No result returned'
+            print(f"ERROR: JavaScript execution is failing - {error_reason}")
             self.message_box_present = False
             return
-        
+
         # Now try the actual detection with a simpler approach
         detection_script = """
         (function() {
             try {
-                console.log('=== MESSAGE BOX DETECTION STARTED ===');
-                
-                // Simple check for any contenteditable element
-                const box = document.querySelector('[contenteditable="true"]');
-                console.log('Found contenteditable element:', !!box);
-                
-                if (box) {
-                    console.log('Element details:', {
-                        tagName: box.tagName,
-                        className: box.className,
-                        ariaLabel: box.getAttribute('aria-label'),
-                        role: box.getAttribute('role'),
-                        dataLexicalEditor: box.getAttribute('data-lexical-editor')
-                    });
-                    return {present: true, element: 'found'};
-                } else {
-                    console.log('No contenteditable elements found');
-                    return {present: false, reason: 'No contenteditable elements'};
+                const selectors = [
+                    'div[aria-label="Message"][role="textbox"][contenteditable="true"]',
+                    'div[contenteditable="true"][data-lexical-editor="true"][role="textbox"]',
+                    'div[contenteditable="true"][data-lexical-editor="true"]',
+                    'div[contenteditable="true"][role="textbox"]',
+                    'div[contenteditable="true"]'
+                ];
+
+                const collectDocs = () => {
+                    const docs = [];
+                    const seen = new Set();
+                    const pushDoc = (doc) => {
+                        if (doc && !seen.has(doc)) {
+                            seen.add(doc);
+                            docs.push(doc);
+                        }
+                    };
+
+                    const walk = (win) => {
+                        try {
+                            pushDoc(win.document);
+                        } catch (error) {
+                            return;
+                        }
+
+                        for (let i = 0; i < win.frames.length; i++) {
+                            try {
+                                walk(win.frames[i]);
+                            } catch (error) {
+                                // ignore cross origin frames
+                            }
+                        }
+                    };
+
+                    walk(window);
+                    return docs;
+                };
+
+                const isVisible = (el) => {
+                    if (!el || !el.ownerDocument) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+
+                const docs = collectDocs();
+                let matched = null;
+
+                for (const doc of docs) {
+                    for (const selector of selectors) {
+                        const nodes = doc.querySelectorAll(selector);
+                        for (const el of nodes) {
+                            if (isVisible(el) && el.getAttribute('aria-disabled') !== 'true') {
+                                matched = { element: el, selector, doc };
+                                break;
+                            }
+                        }
+                        if (matched) break;
+                    }
+                    if (matched) break;
                 }
+
+                if (matched && matched.element) {
+                    const box = matched.element;
+                    const rect = box.getBoundingClientRect();
+                    const visible = isVisible(box);
+                    return {
+                        present: true,
+                        selector: matched.selector,
+                        ariaLabel: box.getAttribute('aria-label') || null,
+                        role: box.getAttribute('role') || null,
+                        dataLexicalEditor: box.getAttribute('data-lexical-editor') || null,
+                        className: box.className || '',
+                        visible,
+                        dimensions: { width: rect.width, height: rect.height }
+                    };
+                }
+
+                const debug = [];
+                for (const doc of docs) {
+                    const editors = doc.querySelectorAll('div[contenteditable="true"]');
+                    for (const el of editors) {
+                        debug.push({
+                            ariaLabel: el.getAttribute('aria-label') || null,
+                            role: el.getAttribute('role') || null,
+                            dataLexicalEditor: el.getAttribute('data-lexical-editor') || null,
+                            className: el.className || '',
+                            visible: isVisible(el),
+                            disabled: el.getAttribute('aria-disabled') === 'true'
+                        });
+                        if (debug.length >= 5) break;
+                    }
+                    if (debug.length >= 5) break;
+                }
+
+                return { present: false, reason: 'No matching composer found', debug };
             } catch (error) {
-                console.log('Error in detection script:', error);
-                return {present: false, reason: 'Script error: ' + error.toString()};
+                return { present: false, reason: 'Script error: ' + error.toString() };
             }
         })()
         """
-        
+
         print("Running simple message box detection...")
         try:
-            result = self.browser.page().runJavaScript(detection_script, 0)
+            result = self._run_javascript_sync(detection_script, timeout_ms=7000)
             print(f"Simple detection result: {result}")
         except Exception as e:
             print(f"ERROR: Detection script execution failed: {e}")
@@ -554,7 +659,7 @@ class BrowserAutomation:
         
         # Run the error check script synchronously
         print("Running synchronous error detection...")
-        result = self.browser.page().runJavaScript(error_check_script, 0)
+        result = self._run_javascript_sync(error_check_script, timeout_ms=7000)
         print(f"Error detection result: {result}")
         
         # Process the result

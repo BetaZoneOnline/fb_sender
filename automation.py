@@ -1,7 +1,7 @@
 import time
 import json
 import os
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, QEventLoop
 
 def make_typing_script(message, autosend=True):
     msg_js = json.dumps(message)  # safe escaping
@@ -172,7 +172,47 @@ class BrowserAutomation:
         self.callback = None  # Callback function for completion
         self.error_detected = False  # Initialize error detection flag
         self.message_box_present = False  # Initialize message box presence flag
-    
+
+    def _run_js(self, script, timeout=5000):
+        """Run JavaScript in the web view and wait synchronously for the result."""
+        result_container = {"done": False, "value": None}
+        loop = QEventLoop()
+
+        def callback(result):
+            result_container["done"] = True
+            result_container["value"] = result
+            if loop.isRunning():
+                loop.quit()
+
+        try:
+            self.browser.page().runJavaScript(script, callback)
+        except Exception as e:
+            print(f"ERROR: JavaScript execution failed with exception: {e}")
+            return None
+
+        timer = QTimer()
+        timer.setSingleShot(True)
+
+        def on_timeout():
+            if not result_container["done"] and loop.isRunning():
+                loop.quit()
+
+        timer.timeout.connect(on_timeout)
+
+        if not result_container["done"]:
+            timer.start(timeout)
+            loop.exec()
+            timer.stop()
+        else:
+            # Result already available synchronously
+            timer.stop()
+
+        if not result_container["done"]:
+            print(f"JavaScript execution timed out after {timeout} ms")
+            return None
+
+        return result_container["value"]
+
     def setup_permanent_popup_blocking(self):
         """Set up permanent popup blocking that runs on every page load"""
         # This script runs on every page load to block popups permanently
@@ -329,13 +369,16 @@ class BrowserAutomation:
         if self.message_sent:
             print("Message already sent, skipping attempt")
             return
-        
+
         if self.attempt_count >= self.max_attempts:
             print("Max attempts reached, skipping attempt")
             if hasattr(self, 'timer') and self.timer.isActive():
                 self.timer.stop()
             return
-        
+
+        # Reset detection state before attempting
+        self.message_box_present = False
+
         # Always disable CSP and popups on every attempt (reset for new pages)
         self.csp_disabled = False  # Reset to ensure CSP is disabled on new pages
         self.disable_csp_and_popups()
@@ -365,7 +408,10 @@ class BrowserAutomation:
     
     def _check_message_box_present(self):
         """Directly check if message typing box is present - synchronous check"""
-        # Use a much simpler script first to test if JavaScript execution works
+        # Reset message box presence before running checks
+        self.message_box_present = False
+
+        # Use a simple script first to make sure JavaScript is executing correctly
         simple_test_script = """
         (function() {
             try {
@@ -376,63 +422,120 @@ class BrowserAutomation:
             }
         })()
         """
-        
+
         print("Testing JavaScript execution...")
-        try:
-            # Try running JavaScript on the browser page
-            test_result = self.browser.page().runJavaScript(simple_test_script, 0)
-            print(f"JavaScript test result: {test_result}")
-        except Exception as e:
-            print(f"ERROR: JavaScript execution failed with exception: {e}")
+        test_result = self._run_js(simple_test_script)
+        print(f"JavaScript test result: {test_result}")
+
+        if not test_result or not test_result.get('success'):
+            error_msg = test_result.get('error', 'No result returned') if test_result else 'No result returned'
+            print(f"ERROR: JavaScript execution is failing - {error_msg}")
             self.message_box_present = False
             return
-        
-        if not test_result:
-            print("ERROR: JavaScript execution is failing - no result returned")
-            self.message_box_present = False
-            return
-        
-        # Now try the actual detection with a simpler approach
-        detection_script = """
-        (function() {
-            try {
+
+        # Build detection script using robust selectors gathered from Messenger UI
+        selectors = json.dumps([
+            '[aria-label="Message"][role="textbox"][contenteditable="true"]',
+            'div[aria-describedby][aria-label="Message"][data-lexical-editor="true"]',
+            'div[contenteditable="true"][data-lexical-editor="true"]',
+            'div[role="textbox"][contenteditable="true"]',
+            'div[contenteditable="true"]'
+        ])
+
+        detection_script = f"""
+        (function() {{
+            try {{
                 console.log('=== MESSAGE BOX DETECTION STARTED ===');
-                
-                // Simple check for any contenteditable element
-                const box = document.querySelector('[contenteditable="true"]');
-                console.log('Found contenteditable element:', !!box);
-                
-                if (box) {
-                    console.log('Element details:', {
-                        tagName: box.tagName,
-                        className: box.className,
-                        ariaLabel: box.getAttribute('aria-label'),
-                        role: box.getAttribute('role'),
-                        dataLexicalEditor: box.getAttribute('data-lexical-editor')
-                    });
-                    return {present: true, element: 'found'};
-                } else {
-                    console.log('No contenteditable elements found');
-                    return {present: false, reason: 'No contenteditable elements'};
-                }
-            } catch (error) {
+
+                const selectors = {selectors};
+                const matches = [];
+
+                function sameOriginDocs() {{
+                    const docs = [document];
+                    const walk = (win) => {{
+                        for (let i = 0; i < win.frames.length; i++) {{
+                            const frame = win.frames[i];
+                            try {{
+                                const doc = frame.document || frame.contentDocument;
+                                if (doc && !docs.includes(doc)) {{
+                                    docs.push(doc);
+                                    walk(frame);
+                                }}
+                            }} catch (err) {{}}
+                        }}
+                    }};
+                    walk(window);
+                    return docs;
+                }}
+
+                function isVisible(el) {{
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                }}
+
+                const docs = sameOriginDocs();
+                for (const doc of docs) {{
+                    for (const selector of selectors) {{
+                        const el = doc.querySelector(selector);
+                        if (!el) continue;
+                        if (!isVisible(el)) continue;
+
+                        const threadComposer = el.closest('div[aria-label="Thread composer"]');
+
+                        matches.push({{
+                            selector,
+                            url: el.ownerDocument.location ? el.ownerDocument.location.href : null,
+                            tagName: el.tagName,
+                            className: el.className,
+                            ariaLabel: el.getAttribute('aria-label'),
+                            role: el.getAttribute('role'),
+                            dataLexicalEditor: el.getAttribute('data-lexical-editor'),
+                            ariaDescribedBy: el.getAttribute('aria-describedby'),
+                            ariaPlaceholder: el.getAttribute('aria-placeholder'),
+                            tabIndex: el.getAttribute('tabindex'),
+                            isContentEditable: el.getAttribute('contenteditable'),
+                            textSnippet: (el.innerText || '').slice(0, 50),
+                            threadComposer: threadComposer ? {{
+                                className: threadComposer.className,
+                                ariaLabel: threadComposer.getAttribute('aria-label'),
+                                role: threadComposer.getAttribute('role')
+                            }} : null
+                        }});
+
+                        // Prefer the first visible match in document order
+                        return {{present: true, matches}};
+                    }}
+                }}
+
+                console.log('No visible composer found for selectors', selectors);
+                return {{present: false, reason: 'No matching composer found', selectors}};
+            }} catch (error) {{
                 console.log('Error in detection script:', error);
-                return {present: false, reason: 'Script error: ' + error.toString()};
-            }
-        })()
+                return {{present: false, reason: 'Script error: ' + error.toString()}};
+            }}
+        }})()
         """
-        
-        print("Running simple message box detection...")
-        try:
-            result = self.browser.page().runJavaScript(detection_script, 0)
-            print(f"Simple detection result: {result}")
-        except Exception as e:
-            print(f"ERROR: Detection script execution failed: {e}")
-            result = None
-        
-        # Process the result
+
+        print("Running message box detection...")
+        result = self._run_js(detection_script)
+        print(f"Detection result: {result}")
+
         if result and result.get('present'):
             self.message_box_present = True
+            matches = result.get('matches', []) or []
+            for match in matches:
+                print(
+                    "Composer candidate -> selector: {selector}, url: {url}, tag: {tag}, role: {role}, aria-label: {aria}, lexical: {lexical}".format(
+                        selector=match.get('selector'),
+                        url=match.get('url'),
+                        tag=match.get('tagName'),
+                        role=match.get('role'),
+                        aria=match.get('ariaLabel'),
+                        lexical=match.get('dataLexicalEditor')
+                    )
+                )
             print("Message input box is present and ready")
         else:
             self.message_box_present = False

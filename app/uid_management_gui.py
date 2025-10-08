@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QTimer, QUrl
+from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -27,54 +27,11 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtWebEngineWidgets import QWebEnginePage, QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineProfile
 
+from app.browser_window import BrowserWindow
 from app.profile_manager import ProfileManager
 from app.storage import ImportReport, Storage, UidRow
 from app.task_engine import TaskEngine
-
-
-class FBWebView(QWebEngineView):
-    FACEBOOK_HOSTS = {
-        "facebook.com",
-        "www.facebook.com",
-        "m.facebook.com",
-        "web.facebook.com",
-        "messenger.com",
-        "www.messenger.com",
-    }
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._profile_storage_path: Optional[Path] = None
-
-    def event(self, event):  # type: ignore[override]
-        if event.type() == event.Type.ToolTip and self.url().host() in self.FACEBOOK_HOSTS:
-            return True
-        return super().event(event)
-
-    def configure_for_profile(self, storage_path: Path) -> None:
-        storage_path = Path(storage_path)
-        storage_path.mkdir(parents=True, exist_ok=True)
-        cache_path = storage_path / "cache"
-        cache_path.mkdir(parents=True, exist_ok=True)
-        profile_name = f"profile_{storage_path.name}"
-        profile = QWebEngineProfile(profile_name, self)
-        profile.setPersistentStoragePath(str(storage_path))
-        profile.setCachePath(str(cache_path))
-        profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
-        page = QWebEnginePage(profile, self)
-        self.setPage(page)
-        self._profile_storage_path = storage_path
-
-    def load_default(self) -> None:
-        self.load(QUrl("https://www.facebook.com/messages"))
-
-    def ensure_default_loaded(self) -> None:
-        current = self.url().toString()
-        if not current or current == "about:blank":
-            self.load_default()
 
 
 @dataclass
@@ -93,14 +50,14 @@ class UidManagementWindow(QMainWindow):
         profile_manager: ProfileManager,
         task_engine: TaskEngine,
         engine_config,
-        web_view: FBWebView,
+        browser_window: BrowserWindow,
     ) -> None:
         super().__init__()
         self._storage = storage
         self._profile_manager = profile_manager
         self._engine = task_engine
         self._engine_config = engine_config
-        self._web_view = web_view
+        self._browser = browser_window
         self._updating_profile_controls = False
         self.setWindowTitle("UID Management Controller")
         self.resize(1500, 900)
@@ -116,6 +73,7 @@ class UidManagementWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         self.action_start = QAction("Start", self)
+        self.action_open_browser = QAction("Open Browser", self)
         self.action_pause = QAction("Pause", self)
         self.action_resume = QAction("Resume", self)
         self.action_stop = QAction("Stop", self)
@@ -123,6 +81,7 @@ class UidManagementWindow(QMainWindow):
         self.action_export = QAction("Export CSV", self)
 
         toolbar.addAction(self.action_start)
+        toolbar.addAction(self.action_open_browser)
         toolbar.addAction(self.action_pause)
         toolbar.addAction(self.action_resume)
         toolbar.addAction(self.action_stop)
@@ -155,7 +114,7 @@ class UidManagementWindow(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.addLayout(self._build_dashboard())
         right_layout.addWidget(self._build_current_uid_card())
-        right_layout.addWidget(self._build_webview_container(), 1)
+        right_layout.addWidget(self._build_browser_panel(), 1)
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(1, 2)
 
@@ -174,10 +133,11 @@ class UidManagementWindow(QMainWindow):
         layout.addWidget(self.table, 2)
 
         self.action_start.triggered.connect(self._start_engine)
+        self.action_open_browser.triggered.connect(lambda: self._ensure_browser_session(show=True))
         self.action_pause.triggered.connect(self._engine.pause)
         self.action_resume.triggered.connect(self._engine.resume)
         self.action_stop.triggered.connect(self._engine.stop)
-        self.action_login.triggered.connect(self._engine.login_only)
+        self.action_login.triggered.connect(self._login_only)
         self.action_export.triggered.connect(self._export_csv)
 
         self._clock_timer = QTimer(self)
@@ -283,8 +243,7 @@ class UidManagementWindow(QMainWindow):
         self.profile_label.setToolTip(str(storage_path))
         self.daily_limit_spin.setValue(self._profile_manager.daily_limit)
         self._updating_profile_controls = False
-        self._web_view.configure_for_profile(storage_path)
-        self._web_view.ensure_default_loaded()
+        self._ensure_browser_session()
         self._refresh_counts()
         self._refresh_table()
         self._update_limit_display()
@@ -375,11 +334,15 @@ class UidManagementWindow(QMainWindow):
         layout.addWidget(self.next_action_label)
         return widget
 
-    def _build_webview_container(self) -> QWidget:
+    def _build_browser_panel(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.addWidget(QLabel("Web session"))
-        layout.addWidget(self._web_view)
+        layout.addWidget(QLabel("Browser session"))
+        self.browser_status_label = QLabel(
+            "Browser window is hidden. Use \"Open Browser\" to log in or monitor automation."
+        )
+        self.browser_status_label.setWordWrap(True)
+        layout.addWidget(self.browser_status_label)
         return container
 
     def _connect_engine(self) -> None:
@@ -396,7 +359,7 @@ class UidManagementWindow(QMainWindow):
         self._engine_config.page_load_countdown_sec = self.countdown_spin.value()
         self._engine_config.retry_max_attempts = self.retry_spin.value()
         self._engine_config.retry_backoff_sec = self.backoff_spin.value()
-        self._web_view.ensure_default_loaded()
+        self._ensure_browser_session(show=True)
         rows = self._storage.list_uids(self._profile_manager.profile_id)
         pending_status = {"FRESH", "FAIL_RETRYABLE"}
         has_pending = any(row.status in pending_status for row in rows)
@@ -409,6 +372,23 @@ class UidManagementWindow(QMainWindow):
             self.status_bar.showMessage("No pending UIDs for this profile", 5000)
             return
         self._engine.start()
+
+    def _login_only(self) -> None:
+        self._engine.login_only()
+        self._ensure_browser_session(show=True)
+        self.status_bar.showMessage("Browser ready for manual login", 5000)
+
+    def _ensure_browser_session(self, show: bool = False) -> None:
+        storage_path = self._profile_manager.profile_storage_path
+        self._browser.set_profile_storage(storage_path)
+        self._browser.ensure_messages_tab()
+        if show:
+            self._browser.show_window()
+            self._browser.ensure_messages_tab()
+        path_str = str(storage_path)
+        self.browser_status_label.setText(
+            f"Active browser profile: {path_str}. Use the toolbar to open the window."
+        )
 
     def _on_engine_state(self, state: str) -> None:
         self.engine_state_label.setText(f"Engine: {state}")
@@ -441,6 +421,12 @@ class UidManagementWindow(QMainWindow):
             self.next_action_label.setText("Next action in: ready")
         else:
             self.next_action_label.setText(f"Next action in: {seconds}s")
+
+    def closeEvent(self, event):  # type: ignore[override]
+        try:
+            self._browser.close()
+        finally:
+            super().closeEvent(event)
 
     def _set_current_uid(self, uid: Optional[UidRow]) -> None:
         if uid is None:

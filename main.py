@@ -6,12 +6,13 @@ from pathlib import Path
 from PyQt6.QtWidgets import QApplication
 
 from app.automations.fb_worker import build_worker
+from app.browser_window import BrowserWindow
 from app.config.loader import load_config
 from app.message_provider import MessageProvider
 from app.profile_manager import ProfileManager
 from app.storage import Storage
 from app.task_engine import EngineConfig, TaskEngine
-from app.uid_management_gui import FBWebView, UidManagementWindow
+from app.uid_management_gui import UidManagementWindow
 
 
 def main() -> int:
@@ -36,10 +37,10 @@ def main() -> int:
         result_decrement_on=config.result_decrement_on,
     )
 
-    web_view = FBWebView()
-    web_view.configure_for_profile(profile_manager.profile_storage_path)
-    web_view.load_default()
-    worker_factory = lambda: build_worker(web_view)
+    browser_window = BrowserWindow()
+    browser_window.set_profile_storage(profile_manager.profile_storage_path)
+    browser_window.ensure_messages_tab()
+    worker_factory = lambda: build_worker(browser_window.current_view())
     task_engine = TaskEngine(
         storage=storage,
         profile_manager=profile_manager,
@@ -53,9 +54,13 @@ def main() -> int:
         profile_manager=profile_manager,
         task_engine=task_engine,
         engine_config=engine_config,
-        web_view=web_view,
+        browser_window=browser_window,
     )
     window.show()
+    browser_window.show_window()
+    browser_window.ensure_messages_tab()
+    window.raise_()
+    window.activateWindow()
     return app.exec()
 
 

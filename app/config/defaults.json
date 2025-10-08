@@ -8,5 +8,6 @@
   "result_decrement_on": "terminal",
   "capture_screenshots_on_fail": true,
   "db_path": "data/app.db",
-  "evidence_dir": "data/evidence"
+  "evidence_dir": "data/evidence",
+  "profile_data_dir": "profile_data"
 }

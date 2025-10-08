@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Tuple
+from pathlib import Path
+from typing import List, Tuple
 
 from zoneinfo import ZoneInfo
+
+from app.storage import ProfileRow
 
 
 @dataclass
@@ -17,26 +20,41 @@ class DailyStatus:
 
 
 class ProfileManager:
-    def __init__(self, profile_row, timezone: str, storage) -> None:
-        self._profile_row = profile_row
-        self._timezone = ZoneInfo(timezone)
+    def __init__(self, storage, timezone: str, initial_profile: ProfileRow | None = None) -> None:
         self._storage = storage
+        self._timezone = ZoneInfo(timezone)
+        self._profile = initial_profile or self._storage.get_profile()
 
     @property
     def profile_id(self) -> int:
-        return int(self._profile_row["id"])
+        return int(self._profile.id)
 
     @property
     def nickname(self) -> str:
-        return str(self._profile_row["nickname"])
+        return str(self._profile.nickname)
 
     @property
     def daily_limit(self) -> int:
-        return int(self._profile_row["daily_limit"])
+        return int(self._profile.daily_limit)
 
-    def update_profile(self, nickname: str, daily_limit: int) -> None:
-        self._storage.update_profile(nickname, daily_limit)
-        self._profile_row = self._storage.get_profile()
+    @property
+    def profile_data_path(self) -> Path:
+        return self._profile.data_path
+
+    def list_profiles(self) -> List[ProfileRow]:
+        return self._storage.list_profiles()
+
+    def select_profile(self, profile_id: int) -> ProfileRow:
+        self._profile = self._storage.get_profile(profile_id)
+        return self._profile
+
+    def create_profile(self, nickname: str, daily_limit: int) -> ProfileRow:
+        self._profile = self._storage.create_profile(nickname, daily_limit)
+        return self._profile
+
+    def update_profile(self, nickname: str, daily_limit: int) -> ProfileRow:
+        self._profile = self._storage.update_profile(self.profile_id, nickname, daily_limit)
+        return self._profile
 
     def compute_daily_status(self) -> DailyStatus:
         counts = self._storage.get_daily_counts(self.profile_id)

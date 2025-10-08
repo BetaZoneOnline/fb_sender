@@ -17,9 +17,14 @@ from app.uid_management_gui import FBWebView, UidManagementWindow
 def main() -> int:
     app = QApplication(sys.argv)
     config = load_config()
-    storage = Storage(config.db_path, config.timezone)
+    storage = Storage(
+        config.db_path,
+        config.timezone,
+        profile_data_dir=config.profile_data_dir,
+        default_daily_limit=config.daily_limit,
+    )
     profile_row = storage.get_profile()
-    profile_manager = ProfileManager(profile_row, config.timezone, storage)
+    profile_manager = ProfileManager(storage, config.timezone, profile_row)
     message_provider = MessageProvider(Path("messages.txt"))
 
     engine_config = EngineConfig(
@@ -31,6 +36,8 @@ def main() -> int:
     )
 
     web_view = FBWebView()
+    web_view.set_profile_storage(profile_manager.profile_data_path)
+    web_view.open_home()
     worker_factory = lambda: build_worker(web_view)
     task_engine = TaskEngine(
         storage=storage,

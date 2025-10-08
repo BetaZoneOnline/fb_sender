@@ -5,14 +5,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -25,7 +28,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineWidgets import QWebEnginePage, QWebEngineProfile, QWebEngineView
 
 from app.profile_manager import ProfileManager
 from app.storage import ImportReport, Storage, UidRow
@@ -42,10 +45,38 @@ class FBWebView(QWebEngineView):
         "www.messenger.com",
     }
 
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._profile: Optional[QWebEngineProfile] = None
+        self._profile_path: Optional[Path] = None
+
     def event(self, event):  # type: ignore[override]
         if event.type() == event.Type.ToolTip and self.url().host() in self.FACEBOOK_HOSTS:
             return True
         return super().event(event)
+
+    def set_profile_storage(self, path: Path) -> None:
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        cache_path = path / "cache"
+        cache_path.mkdir(parents=True, exist_ok=True)
+
+        profile = QWebEngineProfile(str(path), self)
+        profile.setPersistentStoragePath(str(path))
+        profile.setCachePath(str(cache_path))
+        profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+
+        page = QWebEnginePage(profile, self)
+        self.setPage(page)
+        self._profile = profile
+        self._profile_path = path
+
+    def open_home(self) -> None:
+        self.load(QUrl("https://www.facebook.com/messages"))
+
+    @property
+    def profile_path(self) -> Optional[Path]:
+        return self._profile_path
 
 
 @dataclass
@@ -74,11 +105,14 @@ class UidManagementWindow(QMainWindow):
         self._web_view = web_view
         self.setWindowTitle("UID Management Controller")
         self.resize(1500, 900)
+        self._loading_profiles = False
         self._build_ui()
+        self._load_profiles()
         self._connect_engine()
         self._refresh_counts()
         self._refresh_table()
         self._update_limit_display()
+        self.status_bar.showMessage(f"Active profile: {self._profile_manager.nickname}", 4000)
         self._update_clock()
 
     def _build_ui(self) -> None:
@@ -148,18 +182,44 @@ class UidManagementWindow(QMainWindow):
         self.action_pause.triggered.connect(self._engine.pause)
         self.action_resume.triggered.connect(self._engine.resume)
         self.action_stop.triggered.connect(self._engine.stop)
-        self.action_login.triggered.connect(self._engine.login_only)
+        self.action_login.triggered.connect(self._login_only)
         self.action_export.triggered.connect(self._export_csv)
 
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._update_clock)
         self._clock_timer.start(1000)
 
+    def _load_profiles(self, selected_id: Optional[int] = None) -> None:
+        profiles = self._profile_manager.list_profiles()
+        if not profiles:
+            return
+
+        target_id = selected_id or self._profile_manager.profile_id
+        self._loading_profiles = True
+        self.profile_combo.clear()
+        for profile in profiles:
+            display = profile.nickname
+            self.profile_combo.addItem(display, profile.id)
+
+        index = self.profile_combo.findData(target_id)
+        if index < 0:
+            index = 0
+            target_id = profiles[0].id
+        else:
+            data = self.profile_combo.itemData(index)
+            target_id = int(data) if data is not None else profiles[0].id
+        self.profile_combo.setCurrentIndex(index)
+        self._loading_profiles = False
+        if target_id is not None:
+            self._apply_profile_selection(int(target_id))
+
     def _build_header(self):
         layout = QHBoxLayout()
-        self.profile_label = QLabel(f"Profile: {self._profile_manager.nickname}")
-        self.profile_label.setStyleSheet("font-weight: bold; font-size: 18px;")
-        layout.addWidget(self.profile_label)
+        layout.addWidget(QLabel("Profile:"))
+        self.profile_combo = QComboBox()
+        layout.addWidget(self.profile_combo)
+        self.btn_new_profile = QPushButton("Add Profile")
+        layout.addWidget(self.btn_new_profile)
 
         self.engine_state_label = QLabel("Engine: IDLE")
         layout.addWidget(self.engine_state_label)
@@ -167,7 +227,18 @@ class UidManagementWindow(QMainWindow):
         layout.addStretch()
         self.clock_label = QLabel()
         layout.addWidget(self.clock_label)
+
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_combo_changed)
+        self.btn_new_profile.clicked.connect(self._create_profile)
         return layout
+
+    def _on_profile_combo_changed(self) -> None:
+        if self._loading_profiles:
+            return
+        profile_id = self.profile_combo.currentData()
+        if profile_id is None:
+            return
+        self._apply_profile_selection(int(profile_id))
 
     def _build_import_group(self) -> QGroupBox:
         group = QGroupBox("Import UIDs")
@@ -191,6 +262,9 @@ class UidManagementWindow(QMainWindow):
     def _build_settings_group(self) -> QGroupBox:
         group = QGroupBox("Run Settings")
         form = QFormLayout(group)
+
+        self.nickname_edit = QLineEdit(self._profile_manager.nickname)
+        form.addRow("Nickname", self.nickname_edit)
 
         self.daily_limit_spin = QSpinBox()
         self.daily_limit_spin.setRange(1, 500)
@@ -221,6 +295,58 @@ class UidManagementWindow(QMainWindow):
         save_btn.clicked.connect(self._save_profile)
         form.addRow(save_btn)
         return group
+
+    def _apply_profile_selection(self, profile_id: int, load_view: bool = True) -> None:
+        if profile_id != self._profile_manager.profile_id and self._engine.state == "RUNNING":
+            self._engine.stop()
+            self.status_bar.showMessage("Engine stopped due to profile switch", 5000)
+
+        profile = self._profile_manager.select_profile(profile_id)
+        self.nickname_edit.setText(profile.nickname)
+        self.daily_limit_spin.setValue(profile.daily_limit)
+
+        if load_view:
+            current_path = self._web_view.profile_path
+            if current_path != profile.data_path:
+                self._web_view.set_profile_storage(profile.data_path)
+            self._web_view.open_home()
+
+        self._set_current_uid(None)
+        self._refresh_counts()
+        self._refresh_table()
+        self._update_limit_display()
+        self.status_bar.showMessage(f"Active profile: {profile.nickname}", 4000)
+
+    def _create_profile(self) -> None:
+        name, ok = QInputDialog.getText(self, "New Profile", "Profile nickname:")
+        if not ok:
+            return
+        nickname = name.strip()
+        if not nickname:
+            QMessageBox.warning(self, "Profile", "Nickname cannot be empty")
+            return
+        limit, ok = QInputDialog.getInt(
+            self,
+            "New Profile",
+            "Daily limit:",
+            self.daily_limit_spin.value(),
+            1,
+            500,
+        )
+        if not ok:
+            return
+        profile = self._profile_manager.create_profile(nickname, limit)
+        self._load_profiles(selected_id=profile.id)
+        self.status_bar.showMessage(f"Created profile '{profile.nickname}'", 5000)
+
+    def _login_only(self) -> None:
+        self._engine.login_only()
+        current_path = self._web_view.profile_path
+        target_path = self._profile_manager.profile_data_path
+        if current_path != target_path:
+            self._web_view.set_profile_storage(target_path)
+        self._web_view.open_home()
+        self.status_bar.showMessage("Login session ready", 5000)
 
     def _build_dashboard(self):
         layout = QHBoxLayout()
@@ -391,20 +517,21 @@ class UidManagementWindow(QMainWindow):
         self.import_summary.setText(summary)
 
     def _save_profile(self) -> None:
-        nickname = self._profile_manager.nickname
+        nickname = self.nickname_edit.text().strip()
+        if not nickname:
+            QMessageBox.warning(self, "Profile", "Nickname cannot be empty")
+            return
         limit = self.daily_limit_spin.value()
         self._profile_manager.update_profile(nickname, limit)
+        self._load_profiles(selected_id=self._profile_manager.profile_id)
         QMessageBox.information(self, "Profile", "Profile updated")
-        self.profile_label.setText(f"Profile: {self._profile_manager.nickname}")
-        self._refresh_counts()
-        self._update_limit_display()
 
     def _export_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "uid_export.csv", "CSV Files (*.csv)")
         if not path:
             return
         target = Path(path)
-        self._storage.export_csv(target)
+        self._storage.export_csv(target, self._profile_manager.profile_id)
         QMessageBox.information(self, "Export", f"Exported to {target}")
 
     def _update_limit_display(self) -> None:

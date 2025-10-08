@@ -19,6 +19,7 @@ class AppConfig:
     capture_screenshots_on_fail: bool
     db_path: Path
     evidence_dir: Path
+    profile_data_dir: Path
 
     @classmethod
     def from_mapping(cls, data: Dict[str, Any]) -> "AppConfig":
@@ -33,6 +34,7 @@ class AppConfig:
             capture_screenshots_on_fail=bool(data.get("capture_screenshots_on_fail", False)),
             db_path=Path(data.get("db_path", "data/app.db")).expanduser(),
             evidence_dir=Path(data.get("evidence_dir", "data/evidence")).expanduser(),
+            profile_data_dir=Path(data.get("profile_data_dir", "profile_data")).expanduser(),
         )
 
 
@@ -52,6 +54,7 @@ def load_config(config_path: str | os.PathLike[str] | None = None) -> AppConfig:
     config = AppConfig.from_mapping(data)
     config.db_path.parent.mkdir(parents=True, exist_ok=True)
     config.evidence_dir.mkdir(parents=True, exist_ok=True)
+    config.profile_data_dir.mkdir(parents=True, exist_ok=True)
     return config
 
 

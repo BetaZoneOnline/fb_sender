@@ -14,6 +14,17 @@ ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 
 @dataclass
+class ProfileRow:
+    id: int
+    nickname: str
+    daily_limit: int
+    tz: str
+    data_path: Path
+    created_at: str
+    updated_at: str
+
+
+@dataclass
 class UidRow:
     id: int
     raw_input: str
@@ -36,10 +47,19 @@ class ImportReport:
 
 
 class Storage:
-    def __init__(self, db_path: Path, timezone: str) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        timezone: str,
+        profile_data_dir: Path | None = None,
+        default_daily_limit: int = 10,
+    ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.timezone = ZoneInfo(timezone)
+        self.profile_data_dir = Path(profile_data_dir or Path("profile_data"))
+        self.profile_data_dir.mkdir(parents=True, exist_ok=True)
+        self._default_daily_limit = default_daily_limit
         self._init_db()
 
     @contextmanager
@@ -62,6 +82,7 @@ class Storage:
                     nickname TEXT NOT NULL,
                     daily_limit INTEGER NOT NULL,
                     tz TEXT NOT NULL DEFAULT 'Asia/Kathmandu',
+                    data_path TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -99,20 +120,64 @@ class Storage:
                 );
                 """
             )
+            columns = self._list_columns(cur, "profiles")
+            if "data_path" not in columns:
+                cur.execute("ALTER TABLE profiles ADD COLUMN data_path TEXT")
 
             if not self._get_default_profile(cur):
                 now = self._now()
                 cur.execute(
                     """
-                    INSERT INTO profiles (nickname, daily_limit, tz, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO profiles (nickname, daily_limit, tz, data_path, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    ("Profile 1", 10, self.timezone.key, now, now),
+                    ("Profile 1", self._default_daily_limit, self.timezone.key, "", now, now),
                 )
+                profile_id = cur.lastrowid
+                cur.execute(
+                    "UPDATE profiles SET data_path = ? WHERE id = ?",
+                    (str(self._profile_dir_for(profile_id)), profile_id),
+                )
+
+            self._ensure_profile_paths(cur)
 
     def _get_default_profile(self, cur: sqlite3.Cursor):
         cur.execute("SELECT * FROM profiles ORDER BY id LIMIT 1")
         return cur.fetchone()
+
+    def _list_columns(self, cur: sqlite3.Cursor, table: str) -> set[str]:
+        cur.execute(f"PRAGMA table_info({table})")
+        return {row["name"] for row in cur.fetchall()}
+
+    def _profile_dir_for(self, profile_id: int) -> Path:
+        return self.profile_data_dir / f"profile_{profile_id}"
+
+    def _ensure_profile_paths(self, cur: sqlite3.Cursor) -> None:
+        rows = cur.execute("SELECT id, data_path FROM profiles").fetchall()
+        for row in rows:
+            profile_id = int(row["id"])
+            target = self._profile_dir_for(profile_id)
+            target.mkdir(parents=True, exist_ok=True)
+            data_path = row["data_path"]
+            if not data_path:
+                cur.execute(
+                    "UPDATE profiles SET data_path = ?, updated_at = ? WHERE id = ?",
+                    (str(target), self._now(), profile_id),
+                )
+
+    def _row_to_profile(self, row: sqlite3.Row) -> ProfileRow:
+        data_path = row["data_path"] or str(self._profile_dir_for(int(row["id"])))
+        path = Path(data_path)
+        path.mkdir(parents=True, exist_ok=True)
+        return ProfileRow(
+            id=int(row["id"]),
+            nickname=str(row["nickname"]),
+            daily_limit=int(row["daily_limit"]),
+            tz=str(row["tz"]),
+            data_path=path,
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
 
     def _now(self) -> str:
         return datetime.now(tz=self.timezone).strftime(ISO_FORMAT)
@@ -183,26 +248,56 @@ class Storage:
             return None
         return raw
 
-    def get_profile(self) -> sqlite3.Row:
+    def list_profiles(self) -> list[ProfileRow]:
         with self._connect() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM profiles ORDER BY id LIMIT 1")
+            cur.execute("SELECT * FROM profiles ORDER BY id ASC")
+            rows = cur.fetchall()
+        return [self._row_to_profile(row) for row in rows]
+
+    def get_profile(self, profile_id: int | None = None) -> ProfileRow:
+        with self._connect() as conn:
+            cur = conn.cursor()
+            if profile_id is None:
+                cur.execute("SELECT * FROM profiles ORDER BY id LIMIT 1")
+            else:
+                cur.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,))
             row = cur.fetchone()
             if not row:
                 raise RuntimeError("Profile not initialized")
-            return row
+            return self._row_to_profile(row)
 
-    def update_profile(self, nickname: str, daily_limit: int) -> None:
+    def create_profile(self, nickname: str, daily_limit: int) -> ProfileRow:
+        now = self._now()
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO profiles (nickname, daily_limit, tz, data_path, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (nickname, daily_limit, self.timezone.key, "", now, now),
+            )
+            profile_id = cur.lastrowid
+            data_path = str(self._profile_dir_for(profile_id))
+            cur.execute(
+                "UPDATE profiles SET data_path = ? WHERE id = ?",
+                (data_path, profile_id),
+            )
+        return self.get_profile(profile_id)
+
+    def update_profile(self, profile_id: int, nickname: str, daily_limit: int) -> ProfileRow:
         now = self._now()
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE profiles
                 SET nickname = ?, daily_limit = ?, updated_at = ?
-                WHERE id = (SELECT id FROM profiles ORDER BY id LIMIT 1)
+                WHERE id = ?
                 """,
-                (nickname, daily_limit, now),
+                (nickname, daily_limit, now, profile_id),
             )
+        return self.get_profile(profile_id)
 
     def lease_next_uid(self, profile_id: int) -> Optional[UidRow]:
         with self._connect() as conn:
@@ -335,17 +430,28 @@ class Storage:
                 return {"sent_success": 0, "sent_fail": 0}
             return {"sent_success": row["sent_success"], "sent_fail": row["sent_fail"]}
 
-    def export_csv(self, path: Path) -> Path:
+    def export_csv(self, path: Path, profile_id: int | None = None) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn, path.open("w", encoding="utf-8") as fh:
             cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT raw_input, normalized_uid, status, attempts, last_error_code, last_error_msg, last_updated_at
-                FROM uids
-                ORDER BY first_seen_at ASC
-                """
-            )
+            if profile_id is None:
+                cur.execute(
+                    """
+                    SELECT raw_input, normalized_uid, status, attempts, last_error_code, last_error_msg, last_updated_at
+                    FROM uids
+                    ORDER BY first_seen_at ASC
+                    """
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT raw_input, normalized_uid, status, attempts, last_error_code, last_error_msg, last_updated_at
+                    FROM uids
+                    WHERE profile_id = ?
+                    ORDER BY first_seen_at ASC
+                    """,
+                    (profile_id,),
+                )
             fh.write("raw_input,normalized_uid,status,attempts,last_error_code,last_error_msg,last_updated_at\n")
             for row in cur.fetchall():
                 values = [
@@ -394,4 +500,4 @@ class Storage:
             return result
 
 
-__all__ = ["Storage", "ImportReport", "UidRow"]
+__all__ = ["Storage", "ImportReport", "UidRow", "ProfileRow"]

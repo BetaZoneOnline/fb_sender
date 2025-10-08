@@ -1,7 +1,13 @@
 import time
 import json
 import os
-from PyQt6.QtCore import QTimer
+from pathlib import Path
+from PyQt6.QtCore import QEvent, QEventLoop, QTimer, QUrl
+from PyQt6.QtGui import QIcon, QAction
+from PyQt6.QtWidgets import QMainWindow, QTabWidget, QToolBar, QLineEdit
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
+from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 def make_typing_script(message, autosend=True):
     msg_js = json.dumps(message)  # safe escaping
@@ -172,6 +178,8 @@ class BrowserAutomation:
         self.callback = None  # Callback function for completion
         self.error_detected = False  # Initialize error detection flag
         self.message_box_present = False  # Initialize message box presence flag
+        self.last_failure_reason = None
+        self._last_detection_result = None
     
     def setup_permanent_popup_blocking(self):
         """Set up permanent popup blocking that runs on every page load"""
@@ -290,6 +298,7 @@ class BrowserAutomation:
     def type_message(self, message="hi", autosend=True):
         """Type (and optionally send) a message in Facebook Messenger."""
         script = make_typing_script(message, autosend)
+        self.last_failure_reason = None
         self.browser.page().runJavaScript(script, self._type_message_callback)
     
     def set_message(self, message):
@@ -302,26 +311,23 @@ class BrowserAutomation:
     
     def _type_message_callback(self, result):
         """Callback for the typing script"""
-        success = False
         if result and result.get('success'):
             print("Message typing successful - stopping automation timer")
             self.message_sent = True
-            success = True
-            # Stop the timer immediately when message is sent successfully
-            if hasattr(self, 'timer') and self.timer.isActive():
-                self.timer.stop()
-                print("Automation timer stopped")
-        else:
-            reason = result.get('reason', 'Unknown error') if result else 'No result returned'
-            print(f"Message typing failed - {reason}")
-            self.attempt_count += 1
-            if self.attempt_count >= self.max_attempts and hasattr(self, 'timer') and self.timer.isActive():
-                print("Max attempts reached, stopping automation")
-                self.timer.stop()
-        
-        # Call the external callback if set
-        if self.callback:
-            self.callback(success)
+            self._stop_timer("Automation timer stopped")
+            self._notify_callback(True)
+            return
+
+        reason = result.get('reason', 'No result returned') if isinstance(result, dict) else 'No result returned'
+        self.last_failure_reason = reason
+        print(f"Message typing failed - {reason}")
+        self.attempt_count += 1
+
+        if self.attempt_count >= self.max_attempts:
+            print("Max attempts reached, stopping automation")
+
+        self._stop_timer("Automation timer stopped after failure")
+        self._notify_callback(False, reason)
     
     def attempt_typing(self):
         """Attempt to type the message"""
@@ -341,28 +347,32 @@ class BrowserAutomation:
         self.disable_csp_and_popups()
         
         # Directly check if message typing box is present - synchronous check
-        self._check_message_box_present()
-        
+        has_box = self._check_message_box_present()
+
         # Only proceed with typing if message box is present
-        if self.message_box_present:
+        if has_box:
             print("Message input box found, proceeding with message typing - stopping timer")
             # Stop the timer immediately to prevent multiple attempts
-            if hasattr(self, 'timer') and self.timer.isActive():
-                self.timer.stop()
-                print("Automation timer stopped to prevent multiple attempts")
-            
+            self._stop_timer("Automation timer stopped to prevent multiple attempts")
+
             # Try to type the message
             self.type_message(self.current_message)
-            
+
             self.attempt_count += 1
             print(f"Attempt {self.attempt_count}/{self.max_attempts}")
         else:
+            detection_reason = None
+            if isinstance(self._last_detection_result, dict):
+                detection_reason = self._last_detection_result.get('reason')
+            reason_text = detection_reason or 'Message input box not found'
             print("Message input box not found, skipping message typing")
-            self.attempt_count += 1
-            if self.attempt_count >= self.max_attempts and hasattr(self, 'timer') and self.timer.isActive():
-                print("Max attempts reached, stopping automation")
-                self.timer.stop()
-    
+            if detection_reason:
+                print(f"Detection details: {detection_reason}")
+
+            self.last_failure_reason = reason_text
+            self._stop_timer("Automation timer stopped after failure")
+            self._notify_callback(False, reason_text)
+
     def _check_message_box_present(self):
         """Directly check if message typing box is present - synchronous check"""
         # Use a much simpler script first to test if JavaScript execution works
@@ -376,68 +386,124 @@ class BrowserAutomation:
             }
         })()
         """
-        
+
         print("Testing JavaScript execution...")
-        try:
-            # Try running JavaScript on the browser page
-            test_result = self.browser.page().runJavaScript(simple_test_script, 0)
-            print(f"JavaScript test result: {test_result}")
-        except Exception as e:
-            print(f"ERROR: JavaScript execution failed with exception: {e}")
+        test_result = self._run_javascript_sync(simple_test_script, timeout_ms=4000)
+        print(f"JavaScript test result: {test_result}")
+
+        self._last_detection_result = None
+
+        if not test_result or not test_result.get('success'):
+            error_msg = test_result.get('error') if isinstance(test_result, dict) else 'No result returned'
+            print(f"ERROR: JavaScript execution is failing - {error_msg}")
             self.message_box_present = False
-            return
-        
-        if not test_result:
-            print("ERROR: JavaScript execution is failing - no result returned")
-            self.message_box_present = False
-            return
-        
+            self._last_detection_result = {'present': False, 'reason': f'JavaScript execution failed: {error_msg}'}
+            return False
+
         # Now try the actual detection with a simpler approach
         detection_script = """
         (function() {
             try {
                 console.log('=== MESSAGE BOX DETECTION STARTED ===');
-                
-                // Simple check for any contenteditable element
-                const box = document.querySelector('[contenteditable="true"]');
-                console.log('Found contenteditable element:', !!box);
-                
-                if (box) {
-                    console.log('Element details:', {
-                        tagName: box.tagName,
-                        className: box.className,
-                        ariaLabel: box.getAttribute('aria-label'),
-                        role: box.getAttribute('role'),
-                        dataLexicalEditor: box.getAttribute('data-lexical-editor')
-                    });
-                    return {present: true, element: 'found'};
-                } else {
-                    console.log('No contenteditable elements found');
-                    return {present: false, reason: 'No contenteditable elements'};
+
+                const selectors = [
+                    '[aria-label="Message"][role="textbox"][contenteditable="true"]',
+                    '[contenteditable="true"][data-lexical-editor="true"][role="textbox"]',
+                    'div[aria-label="Message"][contenteditable="true"]',
+                    '[role="textbox"][contenteditable="true"]',
+                    'div[contenteditable="true"]'
+                ];
+
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                };
+
+                const collectDocs = () => {
+                    const docs = [];
+                    const visit = (win) => {
+                        if (!win || docs.includes(win.document)) {
+                            return;
+                        }
+                        docs.push(win.document);
+                        for (let i = 0; i < win.frames.length; i++) {
+                            try {
+                                visit(win.frames[i]);
+                            } catch (err) {
+                                // Ignore cross-origin frames
+                            }
+                        }
+                    };
+                    try { visit(window); } catch (err) {}
+                    return docs;
+                };
+
+                const docs = collectDocs();
+                const matches = [];
+
+                for (const doc of docs) {
+                    for (const selector of selectors) {
+                        const elements = Array.from(doc.querySelectorAll(selector));
+                        for (const el of elements) {
+                            if (!visible(el)) continue;
+                            if (el.getAttribute('aria-disabled') === 'true') continue;
+
+                            matches.push({
+                                selector,
+                                attributes: {
+                                    tagName: el.tagName,
+                                    className: el.className,
+                                    ariaLabel: el.getAttribute('aria-label'),
+                                    role: el.getAttribute('role'),
+                                    dataLexicalEditor: el.getAttribute('data-lexical-editor'),
+                                    ariaDescribedBy: el.getAttribute('aria-describedby')
+                                },
+                                frameUrl: (el.ownerDocument && el.ownerDocument.defaultView) ? el.ownerDocument.defaultView.location.href : null
+                            });
+                        }
+                        if (matches.length) break;
+                    }
+                    if (matches.length) break;
                 }
+
+                if (matches.length) {
+                    const first = matches[0];
+                    console.log('Message composer detected using selector', first.selector, first.attributes);
+                    return {present: true, details: first};
+                }
+
+                console.log('No suitable contenteditable message composer located');
+                return {present: false, reason: 'Composer not found with stable selectors'};
             } catch (error) {
                 console.log('Error in detection script:', error);
                 return {present: false, reason: 'Script error: ' + error.toString()};
             }
         })()
         """
-        
+
         print("Running simple message box detection...")
-        try:
-            result = self.browser.page().runJavaScript(detection_script, 0)
-            print(f"Simple detection result: {result}")
-        except Exception as e:
-            print(f"ERROR: Detection script execution failed: {e}")
-            result = None
-        
-        # Process the result
+        result = self._run_javascript_sync(detection_script, timeout_ms=6000)
+        print(f"Simple detection result: {result}")
+
+        self._last_detection_result = result if isinstance(result, dict) else None
+
         if result and result.get('present'):
             self.message_box_present = True
+            details = result.get('details', {})
             print("Message input box is present and ready")
-        else:
-            self.message_box_present = False
-            reason = result.get('reason', 'Unknown reason') if result else 'No result returned'
-            print(f"Message input box not available: {reason}")
+            if details:
+                print(f"Detection selector: {details.get('selector')}")
+                print(f"Element attributes: {details.get('attributes')}")
+                if details.get('frameUrl'):
+                    print(f"Frame URL: {details.get('frameUrl')}")
+            return True
+
+        self.message_box_present = False
+        reason = result.get('reason', 'No result returned') if isinstance(result, dict) else 'No result returned'
+        print(f"Message input box not available: {reason}")
+        return False
     
     def _check_for_errors_sync(self):
         """Synchronous error checking - waits for result before proceeding"""
@@ -554,9 +620,9 @@ class BrowserAutomation:
         
         # Run the error check script synchronously
         print("Running synchronous error detection...")
-        result = self.browser.page().runJavaScript(error_check_script, 0)
+        result = self._run_javascript_sync(error_check_script, timeout_ms=6000)
         print(f"Error detection result: {result}")
-        
+
         # Process the result
         if result and result.get('error'):
             self.error_detected = True
@@ -704,23 +770,219 @@ class BrowserAutomation:
     def automate_messaging(self, message="hi", delay=3, callback=None):
         """Automate the messaging process with retries"""
         print(f"Starting automation with {delay} second delay between attempts")
-        
+
         # Set the message and callback
         self.current_message = message
         self.callback = callback
-        
+
         # Reset state for new automation
         self.message_sent = False
         self.attempt_count = 0
-        
+        self.last_failure_reason = None
+        self._last_detection_result = None
+
         # Set up a timer to attempt typing periodically
         self.timer = QTimer()
         self.timer.timeout.connect(self.attempt_typing)
         self.timer.start(delay * 1000)  # Check every 'delay' seconds
-        
+
         # Stop after max attempts
         QTimer.singleShot(self.max_attempts * delay * 1000, lambda: self.timer.stop() if hasattr(self, 'timer') else None)
+
+    def _run_javascript_sync(self, script, timeout_ms=5000):
+        """Execute JavaScript and wait synchronously for the result."""
+        loop = QEventLoop()
+        result_container = {}
+        timed_out = {'value': False}
+
+        def handle_result(result):
+            if timed_out['value']:
+                return
+            result_container['result'] = result
+            timeout_timer.stop()
+            loop.quit()
+
+        def handle_timeout():
+            timed_out['value'] = True
+            timeout_timer.stop()
+            loop.quit()
+
+        timeout_timer = QTimer()
+        timeout_timer.setSingleShot(True)
+        timeout_timer.timeout.connect(handle_timeout)
+
+        self.browser.page().runJavaScript(script, handle_result)
+        timeout_timer.start(timeout_ms)
+
+        loop.exec()
+
+        if timed_out['value']:
+            print(f"JavaScript execution timed out after {timeout_ms} ms")
+            return None
+
+        return result_container.get('result')
+
+    def _stop_timer(self, message=None):
+        if hasattr(self, 'timer') and self.timer.isActive():
+            self.timer.stop()
+            if message:
+                print(message)
+            else:
+                print("Automation timer stopped")
+
+    def _notify_callback(self, success, reason=None):
+        if success:
+            self.last_failure_reason = None
+        else:
+            self.last_failure_reason = reason
+
+        if self.callback:
+            try:
+                self.callback(success, reason)
+            except TypeError:
+                # Backwards compatibility if callback expects only success flag
+                self.callback(success)
+
+    def get_last_failure_reason(self):
+        return self.last_failure_reason
 
 # Utility function to create automation instance
 def create_automation(browser):
     return BrowserAutomation(browser)
+
+
+class FBWebView(QWebEngineView):
+    _FACEBOOK_HOSTS = {
+        "facebook.com",
+        "www.facebook.com",
+        "m.facebook.com",
+        "web.facebook.com",
+        "messenger.com",
+        "www.messenger.com",
+    }
+
+    def event(self, e):  # type: ignore[override]
+        if e.type() == QEvent.Type.ToolTip:
+            host = self.url().host()
+            if host in self._FACEBOOK_HOSTS:
+                return True
+        return super().event(e)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, profile_dir: Path | str | None = None, profile_name: str | None = None):
+        super().__init__()
+
+        self.setWindowTitle('PyBro Messenger Automation')
+        self.setWindowIcon(QIcon('icon.png'))
+
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(False)
+        self.setCentralWidget(self.tabs)
+
+        base_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        default_profile_dir = base_dir / 'profile_data'
+        target_dir = Path(profile_dir) if profile_dir is not None else default_profile_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = target_dir / 'cache'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        profile_label = profile_name or f"persistent_profile_{target_dir.name}"
+        self.profile = QWebEngineProfile(profile_label, self)
+        self.profile.setPersistentStoragePath(str(target_dir))
+        self.profile.setCachePath(str(cache_dir))
+
+        modern_user_agent = (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        )
+        self.profile.setHttpUserAgent(modern_user_agent)
+
+        self.add_tab()
+
+        navbar = QToolBar()
+        self.addToolBar(navbar)
+
+        back_btn = QAction('⮜', self)
+        back_btn.triggered.connect(lambda: self.current_browser().back())
+        navbar.addAction(back_btn)
+
+        forward_btn = QAction('⮞', self)
+        forward_btn.triggered.connect(lambda: self.current_browser().forward())
+        navbar.addAction(forward_btn)
+
+        reload_btn = QAction('⟳', self)
+        reload_btn.triggered.connect(lambda: self.current_browser().reload())
+        navbar.addAction(reload_btn)
+
+        home_btn = QAction('⌂', self)
+        home_btn.triggered.connect(self.navigate_home)
+        navbar.addAction(home_btn)
+
+        add_tab_btn = QAction('+', self)
+        add_tab_btn.triggered.connect(self.add_tab)
+        navbar.addAction(add_tab_btn)
+
+        self.url_bar = QLineEdit()
+        self.url_bar.returnPressed.connect(self.navigate_to_url)
+        navbar.addWidget(self.url_bar)
+        self.url_bar.setStyleSheet('width: 50%;')
+
+        self.current_browser().urlChanged.connect(self.update_url)
+
+    def add_tab(self):
+        browser = FBWebView()
+        browser.setPage(QWebEnginePage(self.profile, browser))
+        browser.setUrl(QUrl('https://www.facebook.com'))
+        self.tabs.addTab(browser, 'facebook')
+        self.tabs.setCurrentWidget(browser)
+        self.tabs.setTabText(self.tabs.currentIndex(), 'Loading...')
+
+        browser.titleChanged.connect(
+            lambda title, browser=browser: self.tabs.setTabText(self.tabs.indexOf(browser), title)
+        )
+        browser.urlChanged.connect(
+            lambda url, browser=browser: self.update_url(url) if self.tabs.currentWidget() == browser else None
+        )
+
+    def close_tab(self, index):
+        browser_widget = self.tabs.widget(index)
+
+        if browser_widget.url().host() == "www.youtube.com":
+            browser_widget.page().runJavaScript("document.getElementsByTagName('video')[0].pause();")
+
+        if self.tabs.count() < 2:
+            self.close()
+        else:
+            self.tabs.removeTab(index)
+            browser_widget.deleteLater()
+
+    def current_browser(self):
+        return self.tabs.currentWidget()
+
+    def navigate_home(self):
+        self.current_browser().setUrl(QUrl('https://www.google.com'))
+
+    def navigate_to_url(self):
+        url = self.url_bar.text()
+        if 'http' not in url:
+            url = 'https://' + url
+        self.current_browser().setUrl(QUrl(url))
+
+    def update_url(self, q):
+        if self.sender() == self.current_browser():
+            self.url_bar.setText(q.toString())
+            self.url_bar.setCursorPosition(0)
+
+    def closeEvent(self, event):
+        for i in range(self.tabs.count()):
+            browser = self.tabs.widget(i)
+            video_widget = browser.findChild(QVideoWidget)
+            if video_widget:
+                video_widget.player().stop()
+        event.accept()
+
+
+def create_browser_window(profile_dir: Path | str | None = None, profile_name: str | None = None) -> MainWindow:
+    return MainWindow(profile_dir=profile_dir, profile_name=profile_name)

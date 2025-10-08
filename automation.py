@@ -172,6 +172,8 @@ class BrowserAutomation:
         self.callback = None  # Callback function for completion
         self.error_detected = False  # Initialize error detection flag
         self.message_box_present = False  # Initialize message box presence flag
+        self.last_failure_reason = None
+        self._last_detection_result = None
     
     def setup_permanent_popup_blocking(self):
         """Set up permanent popup blocking that runs on every page load"""
@@ -290,6 +292,7 @@ class BrowserAutomation:
     def type_message(self, message="hi", autosend=True):
         """Type (and optionally send) a message in Facebook Messenger."""
         script = make_typing_script(message, autosend)
+        self.last_failure_reason = None
         self.browser.page().runJavaScript(script, self._type_message_callback)
     
     def set_message(self, message):
@@ -302,26 +305,23 @@ class BrowserAutomation:
     
     def _type_message_callback(self, result):
         """Callback for the typing script"""
-        success = False
         if result and result.get('success'):
             print("Message typing successful - stopping automation timer")
             self.message_sent = True
-            success = True
-            # Stop the timer immediately when message is sent successfully
-            if hasattr(self, 'timer') and self.timer.isActive():
-                self.timer.stop()
-                print("Automation timer stopped")
-        else:
-            reason = result.get('reason', 'Unknown error') if result else 'No result returned'
-            print(f"Message typing failed - {reason}")
-            self.attempt_count += 1
-            if self.attempt_count >= self.max_attempts and hasattr(self, 'timer') and self.timer.isActive():
-                print("Max attempts reached, stopping automation")
-                self.timer.stop()
-        
-        # Call the external callback if set
-        if self.callback:
-            self.callback(success)
+            self._stop_timer("Automation timer stopped")
+            self._notify_callback(True)
+            return
+
+        reason = result.get('reason', 'No result returned') if isinstance(result, dict) else 'No result returned'
+        self.last_failure_reason = reason
+        print(f"Message typing failed - {reason}")
+        self.attempt_count += 1
+
+        if self.attempt_count >= self.max_attempts:
+            print("Max attempts reached, stopping automation")
+
+        self._stop_timer("Automation timer stopped after failure")
+        self._notify_callback(False, reason)
     
     def attempt_typing(self):
         """Attempt to type the message"""
@@ -341,28 +341,32 @@ class BrowserAutomation:
         self.disable_csp_and_popups()
         
         # Directly check if message typing box is present - synchronous check
-        self._check_message_box_present()
-        
+        has_box = self._check_message_box_present()
+
         # Only proceed with typing if message box is present
-        if self.message_box_present:
+        if has_box:
             print("Message input box found, proceeding with message typing - stopping timer")
             # Stop the timer immediately to prevent multiple attempts
-            if hasattr(self, 'timer') and self.timer.isActive():
-                self.timer.stop()
-                print("Automation timer stopped to prevent multiple attempts")
-            
+            self._stop_timer("Automation timer stopped to prevent multiple attempts")
+
             # Try to type the message
             self.type_message(self.current_message)
-            
+
             self.attempt_count += 1
             print(f"Attempt {self.attempt_count}/{self.max_attempts}")
         else:
+            detection_reason = None
+            if isinstance(self._last_detection_result, dict):
+                detection_reason = self._last_detection_result.get('reason')
+            reason_text = detection_reason or 'Message input box not found'
             print("Message input box not found, skipping message typing")
-            self.attempt_count += 1
-            if self.attempt_count >= self.max_attempts and hasattr(self, 'timer') and self.timer.isActive():
-                print("Max attempts reached, stopping automation")
-                self.timer.stop()
-    
+            if detection_reason:
+                print(f"Detection details: {detection_reason}")
+
+            self.last_failure_reason = reason_text
+            self._stop_timer("Automation timer stopped after failure")
+            self._notify_callback(False, reason_text)
+
     def _check_message_box_present(self):
         """Directly check if message typing box is present - synchronous check"""
         # Use a much simpler script first to test if JavaScript execution works
@@ -381,11 +385,14 @@ class BrowserAutomation:
         test_result = self._run_javascript_sync(simple_test_script, timeout_ms=4000)
         print(f"JavaScript test result: {test_result}")
 
+        self._last_detection_result = None
+
         if not test_result or not test_result.get('success'):
             error_msg = test_result.get('error') if isinstance(test_result, dict) else 'No result returned'
             print(f"ERROR: JavaScript execution is failing - {error_msg}")
             self.message_box_present = False
-            return
+            self._last_detection_result = {'present': False, 'reason': f'JavaScript execution failed: {error_msg}'}
+            return False
 
         # Now try the actual detection with a simpler approach
         detection_script = """
@@ -474,6 +481,8 @@ class BrowserAutomation:
         result = self._run_javascript_sync(detection_script, timeout_ms=6000)
         print(f"Simple detection result: {result}")
 
+        self._last_detection_result = result if isinstance(result, dict) else None
+
         if result and result.get('present'):
             self.message_box_present = True
             details = result.get('details', {})
@@ -483,10 +492,12 @@ class BrowserAutomation:
                 print(f"Element attributes: {details.get('attributes')}")
                 if details.get('frameUrl'):
                     print(f"Frame URL: {details.get('frameUrl')}")
-        else:
-            self.message_box_present = False
-            reason = result.get('reason', 'No result returned') if isinstance(result, dict) else 'No result returned'
-            print(f"Message input box not available: {reason}")
+            return True
+
+        self.message_box_present = False
+        reason = result.get('reason', 'No result returned') if isinstance(result, dict) else 'No result returned'
+        print(f"Message input box not available: {reason}")
+        return False
     
     def _check_for_errors_sync(self):
         """Synchronous error checking - waits for result before proceeding"""
@@ -753,15 +764,17 @@ class BrowserAutomation:
     def automate_messaging(self, message="hi", delay=3, callback=None):
         """Automate the messaging process with retries"""
         print(f"Starting automation with {delay} second delay between attempts")
-        
+
         # Set the message and callback
         self.current_message = message
         self.callback = callback
-        
+
         # Reset state for new automation
         self.message_sent = False
         self.attempt_count = 0
-        
+        self.last_failure_reason = None
+        self._last_detection_result = None
+
         # Set up a timer to attempt typing periodically
         self.timer = QTimer()
         self.timer.timeout.connect(self.attempt_typing)
@@ -802,6 +815,30 @@ class BrowserAutomation:
             return None
 
         return result_container.get('result')
+
+    def _stop_timer(self, message=None):
+        if hasattr(self, 'timer') and self.timer.isActive():
+            self.timer.stop()
+            if message:
+                print(message)
+            else:
+                print("Automation timer stopped")
+
+    def _notify_callback(self, success, reason=None):
+        if success:
+            self.last_failure_reason = None
+        else:
+            self.last_failure_reason = reason
+
+        if self.callback:
+            try:
+                self.callback(success, reason)
+            except TypeError:
+                # Backwards compatibility if callback expects only success flag
+                self.callback(success)
+
+    def get_last_failure_reason(self):
+        return self.last_failure_reason
 
 # Utility function to create automation instance
 def create_automation(browser):

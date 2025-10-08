@@ -52,6 +52,11 @@ class MessengerAutomation:
         self.current_message = None
         self.current_uid_status = None  # 'sent', 'error', 'attempting'
         self.current_uid_attempts = 0  # Track attempts per UID
+        self.non_retryable_failure_reasons = (
+            'Message input box not found',
+            'Composer not found',
+            'Composer not found with stable selectors'
+        )
         
     def load_config(self):
         """Load configuration from .env file"""
@@ -324,11 +329,13 @@ class MessengerAutomation:
                 callback=self.on_message_completed
             )
     
-    def on_message_completed(self, success):
+    def on_message_completed(self, success, reason=None):
         """Callback when message automation completes"""
+        reason_text = reason or "Unknown error"
+
         if success:
             self.record_uid_attempt(True)
-            
+
             # Schedule next message after delay if we can send more
             if self.can_send_more_today():
                 delay_ms = self.config['DELAY_BETWEEN_MESSAGES'] * 1000
@@ -336,26 +343,51 @@ class MessengerAutomation:
                 QTimer.singleShot(delay_ms, self.start_automation)
             else:
                 print("Daily limit reached or no more UIDs. Automation stopped.")
-        else:
-            # Increment attempt counter for current UID
-            self.current_uid_attempts += 1
-            print(f"Attempt {self.current_uid_attempts}/{self.config['MESSAGE_RETRY_ATTEMPTS']} for UID {self.current_uid}")
-            
-            # Check if we should retry the same UID or move to next
-            if self.current_uid_attempts < self.config['MESSAGE_RETRY_ATTEMPTS']:
-                # Retry same UID
-                print(f"Retrying UID {self.current_uid} after {self.config['RETRY_DELAY_AFTER_FAILURE']} seconds...")
-                QTimer.singleShot(self.config['RETRY_DELAY_AFTER_FAILURE'] * 1000, self.start_automation)
+            return
+
+        # Handle failure scenarios
+        print(f"Automation failed for UID {self.current_uid}: {reason_text}")
+
+        if self._is_non_retryable(reason_text):
+            print("Detected non-retryable failure (message box missing). Recording result and moving on.")
+            self.record_uid_attempt(False, reason_text)
+            self.current_uid_attempts = self.config['MESSAGE_RETRY_ATTEMPTS']
+
+            if self.can_send_more_today():
+                delay_ms = self.config['RETRY_DELAY_AFTER_FAILURE'] * 1000
+                print(f"Waiting {self.config['RETRY_DELAY_AFTER_FAILURE']} seconds before next UID...")
+                QTimer.singleShot(delay_ms, self.start_automation)
             else:
-                # Max attempts reached for this UID, record failure and move to next
-                self.record_uid_attempt(False, f"Message typing failed after {self.config['MESSAGE_RETRY_ATTEMPTS']} attempts")
-                
-                # Try next UID after delay if we can send more
-                if self.can_send_more_today():
-                    print(f"Max attempts reached for UID {self.current_uid}, trying next UID after {self.config['RETRY_DELAY_AFTER_FAILURE']} seconds...")
-                    QTimer.singleShot(self.config['RETRY_DELAY_AFTER_FAILURE'] * 1000, self.start_automation)
-                else:
-                    print("Daily limit reached or no more UIDs. Automation stopped.")
+                print("Daily limit reached or no more UIDs. Automation stopped.")
+            return
+
+        # Increment attempt counter for retryable errors
+        self.current_uid_attempts += 1
+        print(f"Attempt {self.current_uid_attempts}/{self.config['MESSAGE_RETRY_ATTEMPTS']} for UID {self.current_uid}")
+
+        if self.current_uid_attempts < self.config['MESSAGE_RETRY_ATTEMPTS']:
+            print(f"Retrying UID {self.current_uid} after {self.config['RETRY_DELAY_AFTER_FAILURE']} seconds...")
+            QTimer.singleShot(self.config['RETRY_DELAY_AFTER_FAILURE'] * 1000, self.start_automation)
+            return
+
+        failure_reason = f"{reason_text} (after {self.config['MESSAGE_RETRY_ATTEMPTS']} attempts)"
+        self.record_uid_attempt(False, failure_reason)
+
+        if self.can_send_more_today():
+            print(f"Max attempts reached for UID {self.current_uid}, trying next UID after {self.config['RETRY_DELAY_AFTER_FAILURE']} seconds...")
+            QTimer.singleShot(self.config['RETRY_DELAY_AFTER_FAILURE'] * 1000, self.start_automation)
+        else:
+            print("Daily limit reached or no more UIDs. Automation stopped.")
+
+    def _is_non_retryable(self, reason):
+        if not reason:
+            return False
+
+        normalized = reason.lower()
+        if any(token in normalized for token in ('composer', 'message input box', 'message box')):
+            return True
+
+        return any(reason.startswith(prefix) for prefix in self.non_retryable_failure_reasons)
     
     def run(self):
         """Start the application"""

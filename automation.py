@@ -1,7 +1,7 @@
 import time
 import json
 import os
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, QEventLoop
 
 def make_typing_script(message, autosend=True):
     msg_js = json.dumps(message)  # safe escaping
@@ -172,6 +172,36 @@ class BrowserAutomation:
         self.callback = None  # Callback function for completion
         self.error_detected = False  # Initialize error detection flag
         self.message_box_present = False  # Initialize message box presence flag
+
+    def _run_js_sync(self, script, timeout=5000, description="JavaScript evaluation"):
+        """Run JavaScript on the page and wait synchronously for the result."""
+        loop = QEventLoop()
+        result_container = {"finished": False, "value": None}
+
+        def _callback(value):
+            result_container["finished"] = True
+            result_container["value"] = value
+            if loop.isRunning():
+                loop.quit()
+
+        timer = QTimer()
+        timer.setSingleShot(True)
+
+        def _on_timeout():
+            print(f"{description} timed out after {timeout} ms")
+            if loop.isRunning():
+                loop.quit()
+
+        timer.timeout.connect(_on_timeout)
+        timer.start(timeout)
+
+        self.browser.page().runJavaScript(script, _callback)
+        loop.exec()
+
+        timer.stop()
+        if not result_container["finished"]:
+            print(f"{description} returned no result")
+        return result_container["value"]
     
     def setup_permanent_popup_blocking(self):
         """Set up permanent popup blocking that runs on every page load"""
@@ -376,67 +406,115 @@ class BrowserAutomation:
             }
         })()
         """
-        
+
         print("Testing JavaScript execution...")
-        try:
-            # Try running JavaScript on the browser page
-            test_result = self.browser.page().runJavaScript(simple_test_script, 0)
-            print(f"JavaScript test result: {test_result}")
-        except Exception as e:
-            print(f"ERROR: JavaScript execution failed with exception: {e}")
+        test_result = self._run_js_sync(simple_test_script, timeout=3000, description="JavaScript test")
+
+        if not test_result or not test_result.get("success"):
+            error_msg = test_result.get("error") if isinstance(test_result, dict) else "No result returned"
+            print(f"ERROR: JavaScript execution is failing - {error_msg}")
             self.message_box_present = False
             return
-        
-        if not test_result:
-            print("ERROR: JavaScript execution is failing - no result returned")
-            self.message_box_present = False
-            return
-        
+
+        print(f"JavaScript test result: {test_result}")
+
         # Now try the actual detection with a simpler approach
         detection_script = """
         (function() {
             try {
                 console.log('=== MESSAGE BOX DETECTION STARTED ===');
-                
-                // Simple check for any contenteditable element
-                const box = document.querySelector('[contenteditable="true"]');
-                console.log('Found contenteditable element:', !!box);
-                
-                if (box) {
-                    console.log('Element details:', {
-                        tagName: box.tagName,
-                        className: box.className,
-                        ariaLabel: box.getAttribute('aria-label'),
-                        role: box.getAttribute('role'),
-                        dataLexicalEditor: box.getAttribute('data-lexical-editor')
-                    });
-                    return {present: true, element: 'found'};
-                } else {
-                    console.log('No contenteditable elements found');
-                    return {present: false, reason: 'No contenteditable elements'};
+
+                function collectDocs() {
+                    const docs = [document];
+                    const seen = new Set(docs);
+                    const stack = [window];
+                    while (stack.length) {
+                        const win = stack.pop();
+                        for (let i = 0; i < win.frames.length; i++) {
+                            const frameWin = win.frames[i];
+                            try {
+                                const frameDoc = frameWin.document || frameWin.contentDocument;
+                                if (frameDoc && !seen.has(frameDoc)) {
+                                    seen.add(frameDoc);
+                                    docs.push(frameDoc);
+                                    stack.push(frameWin);
+                                }
+                            } catch (err) {
+                                // Ignore cross-origin frames
+                            }
+                        }
+                    }
+                    return docs;
                 }
+
+                const selectors = [
+                    '[role="textbox"][aria-label="Message"][contenteditable="true"]',
+                    '[contenteditable="true"][aria-label="Message"]',
+                    '[contenteditable="true"][data-lexical-editor="true"][aria-placeholder]',
+                    'div[contenteditable="true"][role="textbox"]',
+                    'div[contenteditable="true"]'
+                ];
+
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+                    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+                    return style && style.visibility !== 'hidden' && style.display !== 'none';
+                };
+
+                const docs = collectDocs();
+                for (const doc of docs) {
+                    for (const selector of selectors) {
+                        const elements = Array.from(doc.querySelectorAll(selector));
+                        for (const el of elements) {
+                            if (!isVisible(el)) continue;
+                            if (el.getAttribute('aria-disabled') === 'true') continue;
+
+                            const composer = el.closest('[aria-label="Thread composer"]');
+                            const detail = {
+                                selectorUsed: selector,
+                                tagName: el.tagName,
+                                role: el.getAttribute('role'),
+                                ariaLabel: el.getAttribute('aria-label'),
+                                ariaPlaceholder: el.getAttribute('aria-placeholder'),
+                                ariaDescribedBy: el.getAttribute('aria-describedby'),
+                                dataLexicalEditor: el.getAttribute('data-lexical-editor'),
+                                classList: el.className ? el.className.split(/\s+/) : [],
+                                composerAriaLabel: composer ? composer.getAttribute('aria-label') : null
+                            };
+
+                            console.log('Message input candidate found with details:', detail);
+                            return {present: true, details: detail};
+                        }
+                    }
+                }
+
+                console.log('No suitable message input found');
+                return {present: false, reason: 'No visible enabled contenteditable textbox found'};
             } catch (error) {
                 console.log('Error in detection script:', error);
                 return {present: false, reason: 'Script error: ' + error.toString()};
             }
         })()
         """
-        
-        print("Running simple message box detection...")
-        try:
-            result = self.browser.page().runJavaScript(detection_script, 0)
-            print(f"Simple detection result: {result}")
-        except Exception as e:
-            print(f"ERROR: Detection script execution failed: {e}")
-            result = None
-        
-        # Process the result
+
+        print("Running robust message box detection...")
+        result = self._run_js_sync(
+            detection_script,
+            timeout=5000,
+            description="Message box detection"
+        )
+
         if result and result.get('present'):
             self.message_box_present = True
+            details = result.get('details', {})
             print("Message input box is present and ready")
+            if details:
+                print(f"Detection details: {details}")
         else:
             self.message_box_present = False
-            reason = result.get('reason', 'Unknown reason') if result else 'No result returned'
+            reason = result.get('reason', 'No result returned') if result else 'No result returned'
             print(f"Message input box not available: {reason}")
     
     def _check_for_errors_sync(self):
@@ -554,7 +632,11 @@ class BrowserAutomation:
         
         # Run the error check script synchronously
         print("Running synchronous error detection...")
-        result = self.browser.page().runJavaScript(error_check_script, 0)
+        result = self._run_js_sync(
+            error_check_script,
+            timeout=5000,
+            description="Synchronous error detection"
+        )
         print(f"Error detection result: {result}")
         
         # Process the result

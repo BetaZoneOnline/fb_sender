@@ -1,7 +1,7 @@
 import time
 import json
 import os
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, QEventLoop
 
 def make_typing_script(message, autosend=True):
     msg_js = json.dumps(message)  # safe escaping
@@ -376,67 +376,116 @@ class BrowserAutomation:
             }
         })()
         """
-        
+
         print("Testing JavaScript execution...")
-        try:
-            # Try running JavaScript on the browser page
-            test_result = self.browser.page().runJavaScript(simple_test_script, 0)
-            print(f"JavaScript test result: {test_result}")
-        except Exception as e:
-            print(f"ERROR: JavaScript execution failed with exception: {e}")
+        test_result = self._run_javascript_sync(simple_test_script, timeout_ms=4000)
+        print(f"JavaScript test result: {test_result}")
+
+        if not test_result or not test_result.get('success'):
+            error_msg = test_result.get('error') if isinstance(test_result, dict) else 'No result returned'
+            print(f"ERROR: JavaScript execution is failing - {error_msg}")
             self.message_box_present = False
             return
-        
-        if not test_result:
-            print("ERROR: JavaScript execution is failing - no result returned")
-            self.message_box_present = False
-            return
-        
+
         # Now try the actual detection with a simpler approach
         detection_script = """
         (function() {
             try {
                 console.log('=== MESSAGE BOX DETECTION STARTED ===');
-                
-                // Simple check for any contenteditable element
-                const box = document.querySelector('[contenteditable="true"]');
-                console.log('Found contenteditable element:', !!box);
-                
-                if (box) {
-                    console.log('Element details:', {
-                        tagName: box.tagName,
-                        className: box.className,
-                        ariaLabel: box.getAttribute('aria-label'),
-                        role: box.getAttribute('role'),
-                        dataLexicalEditor: box.getAttribute('data-lexical-editor')
-                    });
-                    return {present: true, element: 'found'};
-                } else {
-                    console.log('No contenteditable elements found');
-                    return {present: false, reason: 'No contenteditable elements'};
+
+                const selectors = [
+                    '[aria-label="Message"][role="textbox"][contenteditable="true"]',
+                    '[contenteditable="true"][data-lexical-editor="true"][role="textbox"]',
+                    'div[aria-label="Message"][contenteditable="true"]',
+                    '[role="textbox"][contenteditable="true"]',
+                    'div[contenteditable="true"]'
+                ];
+
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                };
+
+                const collectDocs = () => {
+                    const docs = [];
+                    const visit = (win) => {
+                        if (!win || docs.includes(win.document)) {
+                            return;
+                        }
+                        docs.push(win.document);
+                        for (let i = 0; i < win.frames.length; i++) {
+                            try {
+                                visit(win.frames[i]);
+                            } catch (err) {
+                                // Ignore cross-origin frames
+                            }
+                        }
+                    };
+                    try { visit(window); } catch (err) {}
+                    return docs;
+                };
+
+                const docs = collectDocs();
+                const matches = [];
+
+                for (const doc of docs) {
+                    for (const selector of selectors) {
+                        const elements = Array.from(doc.querySelectorAll(selector));
+                        for (const el of elements) {
+                            if (!visible(el)) continue;
+                            if (el.getAttribute('aria-disabled') === 'true') continue;
+
+                            matches.push({
+                                selector,
+                                attributes: {
+                                    tagName: el.tagName,
+                                    className: el.className,
+                                    ariaLabel: el.getAttribute('aria-label'),
+                                    role: el.getAttribute('role'),
+                                    dataLexicalEditor: el.getAttribute('data-lexical-editor'),
+                                    ariaDescribedBy: el.getAttribute('aria-describedby')
+                                },
+                                frameUrl: (el.ownerDocument && el.ownerDocument.defaultView) ? el.ownerDocument.defaultView.location.href : null
+                            });
+                        }
+                        if (matches.length) break;
+                    }
+                    if (matches.length) break;
                 }
+
+                if (matches.length) {
+                    const first = matches[0];
+                    console.log('Message composer detected using selector', first.selector, first.attributes);
+                    return {present: true, details: first};
+                }
+
+                console.log('No suitable contenteditable message composer located');
+                return {present: false, reason: 'Composer not found with stable selectors'};
             } catch (error) {
                 console.log('Error in detection script:', error);
                 return {present: false, reason: 'Script error: ' + error.toString()};
             }
         })()
         """
-        
+
         print("Running simple message box detection...")
-        try:
-            result = self.browser.page().runJavaScript(detection_script, 0)
-            print(f"Simple detection result: {result}")
-        except Exception as e:
-            print(f"ERROR: Detection script execution failed: {e}")
-            result = None
-        
-        # Process the result
+        result = self._run_javascript_sync(detection_script, timeout_ms=6000)
+        print(f"Simple detection result: {result}")
+
         if result and result.get('present'):
             self.message_box_present = True
+            details = result.get('details', {})
             print("Message input box is present and ready")
+            if details:
+                print(f"Detection selector: {details.get('selector')}")
+                print(f"Element attributes: {details.get('attributes')}")
+                if details.get('frameUrl'):
+                    print(f"Frame URL: {details.get('frameUrl')}")
         else:
             self.message_box_present = False
-            reason = result.get('reason', 'Unknown reason') if result else 'No result returned'
+            reason = result.get('reason', 'No result returned') if isinstance(result, dict) else 'No result returned'
             print(f"Message input box not available: {reason}")
     
     def _check_for_errors_sync(self):
@@ -554,9 +603,9 @@ class BrowserAutomation:
         
         # Run the error check script synchronously
         print("Running synchronous error detection...")
-        result = self.browser.page().runJavaScript(error_check_script, 0)
+        result = self._run_javascript_sync(error_check_script, timeout_ms=6000)
         print(f"Error detection result: {result}")
-        
+
         # Process the result
         if result and result.get('error'):
             self.error_detected = True
@@ -717,9 +766,42 @@ class BrowserAutomation:
         self.timer = QTimer()
         self.timer.timeout.connect(self.attempt_typing)
         self.timer.start(delay * 1000)  # Check every 'delay' seconds
-        
+
         # Stop after max attempts
         QTimer.singleShot(self.max_attempts * delay * 1000, lambda: self.timer.stop() if hasattr(self, 'timer') else None)
+
+    def _run_javascript_sync(self, script, timeout_ms=5000):
+        """Execute JavaScript and wait synchronously for the result."""
+        loop = QEventLoop()
+        result_container = {}
+        timed_out = {'value': False}
+
+        def handle_result(result):
+            if timed_out['value']:
+                return
+            result_container['result'] = result
+            timeout_timer.stop()
+            loop.quit()
+
+        def handle_timeout():
+            timed_out['value'] = True
+            timeout_timer.stop()
+            loop.quit()
+
+        timeout_timer = QTimer()
+        timeout_timer.setSingleShot(True)
+        timeout_timer.timeout.connect(handle_timeout)
+
+        self.browser.page().runJavaScript(script, handle_result)
+        timeout_timer.start(timeout_ms)
+
+        loop.exec()
+
+        if timed_out['value']:
+            print(f"JavaScript execution timed out after {timeout_ms} ms")
+            return None
+
+        return result_container.get('result')
 
 # Utility function to create automation instance
 def create_automation(browser):

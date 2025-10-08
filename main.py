@@ -1,9 +1,7 @@
 import sys
 import os
 import random
-import json
-import time
-from datetime import datetime, date
+from urllib.parse import urlparse, parse_qs
 from PyQt6.QtCore import *
 from PyQt6.QtWidgets import *
 from PyQt6.QtWebEngineWidgets import *
@@ -11,6 +9,8 @@ from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 from PyQt6.QtGui import QIcon, QAction
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtCore import QEvent
+
+from uid_manager import UIDTracker
 
 
 class FBWebView(QWebEngineView):
@@ -39,10 +39,12 @@ from automation import create_automation
 class MessengerAutomation:
     def __init__(self):
         self.load_config()
-        self.load_uids()
         self.load_messages()
-        self.load_tracker()
-        
+        self.load_uids()
+        self.tracker_file = 'uid_tracker.json'
+        self.uid_tracker = UIDTracker(self.all_uids, self.tracker_file, self.config['MAX_MESSAGES_PER_DAY'])
+        self._print_tracker_status()
+
         # Create main window
         self.window = MainWindow()
         self.automation = None
@@ -52,6 +54,12 @@ class MessengerAutomation:
         self.current_message = None
         self.current_uid_status = None  # 'sent', 'error', 'attempting'
         self.current_uid_attempts = 0  # Track attempts per UID
+        self._retry_same_uid = False
+        self._automation_active = False
+        self._pending_action = None
+        self._deferred_action_timer = QTimer()
+        self._deferred_action_timer.setSingleShot(True)
+        self._deferred_action_timer.timeout.connect(self._run_pending_action)
         self.non_retryable_failure_reasons = (
             'Message input box not found',
             'Composer not found',
@@ -94,24 +102,57 @@ class MessengerAutomation:
         print("Configuration loaded:", self.config)
     
     def load_uids(self):
-        """Load UIDs from uids.txt"""
+        """Load, normalize, and de-duplicate UIDs from uids.txt"""
+        raw_lines = []
         try:
             with open('uids.txt', 'r', encoding='utf-8') as f:
-                self.all_uids = [line.strip() for line in f if line.strip()]
-            
-            if not self.all_uids:
-                print("Error: No UIDs found in uids.txt")
-                sys.exit(1)
-                
-            print(f"Loaded {len(self.all_uids)} UIDs from uids.txt")
-            
+                raw_lines = [line.strip() for line in f if line.strip()]
         except FileNotFoundError:
             print("Error: uids.txt not found")
             sys.exit(1)
         except Exception as e:
             print(f"Error reading uids.txt: {e}")
             sys.exit(1)
-    
+
+        unique_uids = []
+        duplicates = []
+        invalid = []
+        seen = set()
+
+        for raw in raw_lines:
+            if raw.startswith('#'):
+                continue
+
+            normalized = self._normalize_uid(raw)
+            if not normalized:
+                invalid.append(raw)
+                continue
+
+            if normalized in seen:
+                duplicates.append(normalized)
+                continue
+
+            seen.add(normalized)
+            unique_uids.append(normalized)
+
+        if not unique_uids:
+            print("Error: No valid UIDs found after normalization")
+            sys.exit(1)
+
+        self.all_uids = unique_uids
+        self.uid_import_report = {
+            'total_lines': len(raw_lines),
+            'unique': len(unique_uids),
+            'duplicates_skipped': len(duplicates),
+            'invalid_entries': len(invalid),
+        }
+
+        print(f"Loaded {len(unique_uids)} unique UIDs from uids.txt")
+        if duplicates:
+            print(f"Skipped {len(duplicates)} duplicate UID entries")
+        if invalid:
+            print(f"Ignored {len(invalid)} invalid UID entries")
+
     def load_messages(self):
         """Load messages from messages.txt"""
         try:
@@ -131,198 +172,126 @@ class MessengerAutomation:
             print(f"Error reading messages.txt: {e}")
             sys.exit(1)
     
-    def load_tracker(self):
-        """Load UID tracking data"""
-        self.tracker_file = 'uid_tracker.json'
-        today = date.today().isoformat()
-        
-        try:
-            with open(self.tracker_file, 'r') as f:
-                self.tracker = json.load(f)
-                
-            # Check if we need to reset for new day
-            if self.tracker['last_reset_date'] != today:
-                print(f"New day detected: {today}, resetting daily counters")
-                self.tracker['last_reset_date'] = today
-                self.tracker['daily_stats'][today] = {
-                    "total_attempted": 0,
-                    "successful_sends": 0,
-                    "errors": 0,
-                    "used_uids": []
-                }
-                self.save_tracker()
-            else:
-                # Ensure today's stats exist
-                if today not in self.tracker['daily_stats']:
-                    self.tracker['daily_stats'][today] = {
-                        "total_attempted": 0,
-                        "successful_sends": 0,
-                        "errors": 0,
-                        "used_uids": []
-                    }
-                    self.save_tracker()
-                    
-        except FileNotFoundError:
-            # Initialize new tracker
-            self.tracker = {
-                "last_reset_date": today,
-                "used_uids": [],
-                "daily_stats": {
-                    today: {
-                        "total_attempted": 0,
-                        "successful_sends": 0,
-                        "errors": 0,
-                        "used_uids": []
-                    }
-                }
-            }
-            self.save_tracker()
-        except Exception as e:
-            print(f"Error loading tracker: {e}")
-            sys.exit(1)
-            
-        # Print current status
-        today_stats = self.tracker['daily_stats'][today]
-        print(f"Today's Status: {today_stats['successful_sends']} sent, {today_stats['errors']} errors, {today_stats['total_attempted']} attempted")
-        print(f"Total used UIDs: {len(self.tracker['used_uids'])}")
-        print(f"Available UIDs: {len(self.all_uids) - len(self.tracker['used_uids'])}")
-    
-    def save_tracker(self):
-        """Save UID tracking data"""
-        try:
-            with open(self.tracker_file, 'w') as f:
-                json.dump(self.tracker, f, indent=4)
-        except Exception as e:
-            print(f"Error saving tracker: {e}")
-    
     def get_available_uids(self):
         """Get list of UIDs that haven't been used yet"""
-        used_set = set(self.tracker['used_uids'])
-        available = [uid for uid in self.all_uids if uid not in used_set]
-        return available
-    
+        return self.uid_tracker.available_uids()
+
     def can_send_more_today(self):
         """Check if we can send more messages today"""
-        today = date.today().isoformat()
-        today_stats = self.tracker['daily_stats'][today]
-        
-        if today_stats['successful_sends'] >= self.config['MAX_MESSAGES_PER_DAY']:
-            print(f"Daily limit reached: {today_stats['successful_sends']}/{self.config['MAX_MESSAGES_PER_DAY']}")
+        if not self.uid_tracker.can_send_more_today():
+            remaining = self.uid_tracker.remaining_quota()
+            sent = self.uid_tracker.today_summary().get('successful_sends', 0)
+            if remaining <= 0:
+                print(f"Daily limit reached: {sent}/{self.config['MAX_MESSAGES_PER_DAY']}")
+            else:
+                print("No more available UIDs to try")
             return False
-        
-        available_uids = self.get_available_uids()
-        if not available_uids:
-            print("No more available UIDs to try")
-            return False
-            
+
         return True
     
     def select_next_uid_and_message(self):
         """Select next available UID and random message - process in file order"""
-        available_uids = self.get_available_uids()
-        
-        if not available_uids:
+        next_uid = self.uid_tracker.next_uid()
+
+        if not next_uid:
             print("No available UIDs left")
             return None, None
-            
-        # Process UIDs in the order they appear in the original file
-        # This ensures systematic processing from top to bottom
-        for uid in self.all_uids:
-            if uid in available_uids:
-                self.current_uid = uid
-                self.current_message = random.choice(self.messages)
-                self.current_uid_status = 'attempting'
-                
-                print(f"Selected UID: {self.current_uid} (in file order)")
-                print(f"Selected message: {self.current_message}")
-                print(f"Available UIDs remaining: {len(available_uids) - 1}")
-                
-                return self.current_uid, self.current_message
-        
-        # Fallback if no UID found (shouldn't happen)
-        return None, None
+
+        self.current_uid = next_uid
+        self.current_message = random.choice(self.messages)
+        self.current_uid_status = 'attempting'
+
+        remaining_after = max(0, len(self.uid_tracker.available_uids()) - 1)
+        print(f"Selected UID: {self.current_uid} (in file order)")
+        print(f"Selected message: {self.current_message}")
+        print(f"Available UIDs remaining after this: {remaining_after}")
+
+        return self.current_uid, self.current_message
     
     def record_uid_attempt(self, success, error_reason=None):
         """Record UID attempt result"""
-        today = date.today().isoformat()
-        
-        # Add to used UIDs if not already there
-        if self.current_uid not in self.tracker['used_uids']:
-            self.tracker['used_uids'].append(self.current_uid)
-        
-        # Update daily stats
-        self.tracker['daily_stats'][today]['total_attempted'] += 1
-        
+        attempts = max(1, self.current_uid_attempts)
+        self.uid_tracker.complete_uid(self.current_uid, success, attempts, error_reason)
+
+        self.current_uid_status = 'sent' if success else 'error'
         if success:
-            self.tracker['daily_stats'][today]['successful_sends'] += 1
-            self.current_uid_status = 'sent'
             print(f"✅ UID {self.current_uid} - Message sent successfully")
         else:
-            self.tracker['daily_stats'][today]['errors'] += 1
-            self.current_uid_status = 'error'
             error_msg = f" - {error_reason}" if error_reason else ""
             print(f"❌ UID {self.current_uid} - Failed{error_msg}")
-        
-        # Add to today's used UIDs
-        if self.current_uid not in self.tracker['daily_stats'][today]['used_uids']:
-            self.tracker['daily_stats'][today]['used_uids'].append(self.current_uid)
-        
-        self.save_tracker()
-        
-        # Print updated status
-        today_stats = self.tracker['daily_stats'][today]
+
+        today_stats = self.uid_tracker.today_summary()
         print(f"Progress: {today_stats['successful_sends']} sent, {today_stats['errors']} errors, {today_stats['total_attempted']} attempted")
         print(f"Available UIDs remaining: {len(self.get_available_uids())}")
     
     def start_automation(self):
         """Start the automation process"""
-        if not self.can_send_more_today():
-            print("Cannot send more messages today. Exiting.")
+        if self._automation_active:
+            print("Automation already running, skipping new start request")
             return
-            
-        uid, message = self.select_next_uid_and_message()
-        
-        if not uid:
-            print("No UIDs available to process")
-            return
-            
-        # Reset attempt counter for new UID
-        self.current_uid_attempts = 0
-        
+
+        retrying = False
+        if self._retry_same_uid and self.current_uid:
+            retrying = True
+            uid = self.current_uid
+            message = self.current_message
+            print(f"Retrying UID {uid} (attempt {self.current_uid_attempts + 1})")
+        else:
+            if not self.can_send_more_today():
+                print("Cannot send more messages today. Exiting.")
+                return
+
+            uid, message = self.select_next_uid_and_message()
+
+            if not uid:
+                print("No UIDs available to process")
+                return
+
+            self.current_uid_attempts = 0
+
+        self._retry_same_uid = False
+        self._automation_active = True
+
         # Disconnect any previous loadFinished connections to prevent stacking
+        browser = self.window.current_browser()
         try:
-            self.window.current_browser().loadFinished.disconnect()
-        except:
+            browser.loadFinished.disconnect(self.on_page_loaded)
+        except (TypeError, RuntimeError):
             pass
-        
+
         # Set up automation
-        self.automation = create_automation(self.window.current_browser())
+        self.automation = create_automation(browser)
         self.automation.set_message(message)
-        
+
         # Navigate to the selected UID with proper timing
         url = f'https://www.facebook.com/messages/t/{uid}'
-        print(f"Navigating to: {url}")
-        
-        # Use a small delay before navigation to ensure browser is ready
-        QTimer.singleShot(500, lambda: self.window.current_browser().setUrl(QUrl(url)))
-        
+        action_desc = "Retry navigation" if retrying else "Navigating to"
+        print(f"{action_desc}: {url}")
+
+        def _perform_navigation():
+            browser.setUrl(QUrl(url))
+
+        QTimer.singleShot(500, _perform_navigation)
+
         # Start automation after page loads (single connection)
-        self.window.current_browser().loadFinished.connect(self.on_page_loaded, Qt.ConnectionType.QueuedConnection)
+        browser.loadFinished.connect(self.on_page_loaded, Qt.ConnectionType.UniqueConnection)
     
     def on_page_loaded(self, success):
         """Callback when page is loaded"""
         if success:
             print(f"Page loaded successfully, waiting {self.config['PAGE_LOAD_WAIT_TIME']} seconds for full load...")
             # Wait for page to fully load, then start automation
-            QTimer.singleShot(self.config['PAGE_LOAD_WAIT_TIME'] * 1000, self.start_message_automation)
+            self._schedule_action(self.config['PAGE_LOAD_WAIT_TIME'], self.start_message_automation, "begin message automation")
         else:
             print("Failed to load page")
             self.record_uid_attempt(False, "Page load failed")
-            QTimer.singleShot(self.config['RETRY_DELAY_AFTER_FAILURE'] * 1000, self.start_automation)
+            self._automation_active = False
+            self._schedule_action(self.config['RETRY_DELAY_AFTER_FAILURE'], self.start_automation, "retry after load failure")
     
     def start_message_automation(self):
         """Start the message automation"""
         if self.automation:
+            self.current_uid_attempts += 1
             self.automation.automate_messaging(
                 message=self.current_message,
                 delay=self.config['MESSAGE_RETRY_DELAY'],
@@ -333,14 +302,15 @@ class MessengerAutomation:
         """Callback when message automation completes"""
         reason_text = reason or "Unknown error"
 
+        self._automation_active = False
+
         if success:
             self.record_uid_attempt(True)
 
             # Schedule next message after delay if we can send more
             if self.can_send_more_today():
-                delay_ms = self.config['DELAY_BETWEEN_MESSAGES'] * 1000
                 print(f"Waiting {self.config['DELAY_BETWEEN_MESSAGES']} seconds before next message...")
-                QTimer.singleShot(delay_ms, self.start_automation)
+                self._schedule_action(self.config['DELAY_BETWEEN_MESSAGES'], self.start_automation, "next UID after success")
             else:
                 print("Daily limit reached or no more UIDs. Automation stopped.")
             return
@@ -351,23 +321,21 @@ class MessengerAutomation:
         if self._is_non_retryable(reason_text):
             print("Detected non-retryable failure (message box missing). Recording result and moving on.")
             self.record_uid_attempt(False, reason_text)
-            self.current_uid_attempts = self.config['MESSAGE_RETRY_ATTEMPTS']
 
             if self.can_send_more_today():
-                delay_ms = self.config['RETRY_DELAY_AFTER_FAILURE'] * 1000
                 print(f"Waiting {self.config['RETRY_DELAY_AFTER_FAILURE']} seconds before next UID...")
-                QTimer.singleShot(delay_ms, self.start_automation)
+                self._schedule_action(self.config['RETRY_DELAY_AFTER_FAILURE'], self.start_automation, "next UID after non-retryable failure")
             else:
                 print("Daily limit reached or no more UIDs. Automation stopped.")
             return
 
         # Increment attempt counter for retryable errors
-        self.current_uid_attempts += 1
         print(f"Attempt {self.current_uid_attempts}/{self.config['MESSAGE_RETRY_ATTEMPTS']} for UID {self.current_uid}")
 
         if self.current_uid_attempts < self.config['MESSAGE_RETRY_ATTEMPTS']:
             print(f"Retrying UID {self.current_uid} after {self.config['RETRY_DELAY_AFTER_FAILURE']} seconds...")
-            QTimer.singleShot(self.config['RETRY_DELAY_AFTER_FAILURE'] * 1000, self.start_automation)
+            self._retry_same_uid = True
+            self._schedule_action(self.config['RETRY_DELAY_AFTER_FAILURE'], self.start_automation, "retry same UID")
             return
 
         failure_reason = f"{reason_text} (after {self.config['MESSAGE_RETRY_ATTEMPTS']} attempts)"
@@ -375,7 +343,7 @@ class MessengerAutomation:
 
         if self.can_send_more_today():
             print(f"Max attempts reached for UID {self.current_uid}, trying next UID after {self.config['RETRY_DELAY_AFTER_FAILURE']} seconds...")
-            QTimer.singleShot(self.config['RETRY_DELAY_AFTER_FAILURE'] * 1000, self.start_automation)
+            self._schedule_action(self.config['RETRY_DELAY_AFTER_FAILURE'], self.start_automation, "next UID after retries exhausted")
         else:
             print("Daily limit reached or no more UIDs. Automation stopped.")
 
@@ -392,11 +360,65 @@ class MessengerAutomation:
     def run(self):
         """Start the application"""
         self.window.showMaximized()
-        
+
         # Start automation after window is shown
-        QTimer.singleShot(2000, self.start_automation)
-        
+        self._schedule_action(2, self.start_automation, "initial automation start")
+
         return self.window
+
+    def _print_tracker_status(self):
+        today_stats = self.uid_tracker.today_summary()
+        remaining = self.uid_tracker.remaining_quota()
+        print(
+            f"Today's Status: {today_stats['successful_sends']} sent, {today_stats['errors']} errors, {today_stats['total_attempted']} attempted"
+        )
+        print(f"Remaining daily quota: {remaining}")
+        print(f"Available UIDs: {len(self.get_available_uids())}")
+
+    def _normalize_uid(self, raw_uid: str):
+        candidate = raw_uid.strip()
+        if not candidate:
+            return None
+
+        if candidate.isdigit():
+            return candidate
+
+        if candidate.startswith('http://') or candidate.startswith('https://'):
+            parsed = urlparse(candidate)
+            if not parsed.path:
+                return None
+
+            if 'profile.php' in parsed.path:
+                query = parse_qs(parsed.query)
+                fb_id = query.get('id', [])
+                if fb_id:
+                    return fb_id[0]
+                return None
+
+            path = parsed.path.strip('/')
+            if not path:
+                return None
+
+            return path.split('/')[0]
+
+        return candidate
+
+    def _schedule_action(self, delay_seconds, callback, description):
+        if delay_seconds < 0:
+            delay_seconds = 0
+
+        if self._deferred_action_timer.isActive():
+            self._deferred_action_timer.stop()
+
+        self._pending_action = callback
+        print(f"Scheduled {description} in {delay_seconds} seconds")
+        self._deferred_action_timer.start(int(delay_seconds * 1000))
+
+    def _run_pending_action(self):
+        action = self._pending_action
+        self._pending_action = None
+        if callable(action):
+            action()
 
 
 class MainWindow(QMainWindow):
